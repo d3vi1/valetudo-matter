@@ -15,14 +15,14 @@ use rs_matter::{
 #[derive(Default)]
 struct Context {
     notifications: Cell<usize>,
-    cluster_paths: RefCell<Vec<(u16,u32)>>,
+    cluster_paths: RefCell<Vec<(u16, u32)>>,
 }
 impl dm::AttrChangeNotifier for Context {
     fn notify_attr_changed(&self, _: u16, _: u32, _: u32) {
         self.notifications.set(self.notifications.get() + 1);
     }
     fn notify_cluster_changed(&self, endpoint: u16, cluster: u32) {
-        self.cluster_paths.borrow_mut().push((endpoint,cluster));
+        self.cluster_paths.borrow_mut().push((endpoint, cluster));
         self.notifications.set(self.notifications.get() + 1);
     }
     fn notify_endpoint_changed(&self, _: u16) {
@@ -1580,8 +1580,16 @@ fn mapping_capability_advertises_mode_and_uses_mapping_api_without_unsafe_resume
         // Timing is now present for this acknowledged, continuously observed mapping.
         let events = device.pending_events.borrow();
         assert_eq!(events.len(), 1);
-        assert!(matches!(events.front().unwrap(), OperationalEvent::CompletedWithTiming(0,
-            CompletionTiming { total_seconds: Some(_), paused_seconds: Some(0) })));
+        assert!(matches!(
+            events.front().unwrap(),
+            OperationalEvent::CompletedWithTiming(
+                0,
+                CompletionTiming {
+                    total_seconds: Some(_),
+                    paused_seconds: Some(0)
+                }
+            )
+        ));
         drop(events);
     }));
     server.join().unwrap();

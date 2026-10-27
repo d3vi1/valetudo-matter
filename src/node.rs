@@ -41,10 +41,7 @@ use crate::generated::{
 };
 use crate::net::Netif;
 
-pub(crate) async fn run(
-    device: &Device,
-    persistence_dir: &Path,
-) -> anyhow::Result<()> {
+pub(crate) async fn run(device: &Device, persistence_dir: &Path) -> anyhow::Result<()> {
     let identity = crate::identity::Identity::load(&device.client).await?;
     let basic_info = identity.basic_info();
     let native = std::env::var("VALETUDO_MATTER_NATIVE_DIAGNOSTICS").as_deref() == Ok("1");
@@ -138,24 +135,31 @@ pub(crate) async fn run(
     }
 
     let mut monitor = pin!(async {
-        future::zip(device.monitor_identify(&subscriptions), future::zip(
-            device.monitor_segments(&subscriptions),
+        future::zip(
+            device.monitor_identify(&subscriptions),
             future::zip(
-                device.monitor_status(
-                    &subscriptions,
-                    RUN_MODE_CLUSTER.id,
-                    CLEAN_MODE_CLUSTER.id,
-                    OPERATIONAL_STATE_CLUSTER.id,
+                device.monitor_segments(&subscriptions),
+                future::zip(
+                    device.monitor_status(
+                        &subscriptions,
+                        RUN_MODE_CLUSTER.id,
+                        CLEAN_MODE_CLUSTER.id,
+                        OPERATIONAL_STATE_CLUSTER.id,
+                    ),
+                    async {
+                        loop {
+                            device.power_battery.update(
+                                device.battery.get(),
+                                std::time::Instant::now(),
+                                &subscriptions,
+                            );
+                            device.flush_events(&dm);
+                            smol::Timer::after(std::time::Duration::from_millis(100)).await;
+                        }
+                    },
                 ),
-                async {
-                    loop {
-                        device.power_battery.update(device.battery.get(), std::time::Instant::now(), &subscriptions);
-                        device.flush_events(&dm);
-                        smol::Timer::after(std::time::Duration::from_millis(100)).await;
-                    }
-                },
             ),
-        ))
+        )
         .await;
         Ok::<(), rs_matter::error::Error>(())
     });

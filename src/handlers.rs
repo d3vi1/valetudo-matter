@@ -77,7 +77,6 @@ impl<T: Copy + PartialEq> VersionedCell<T> {
 
         old_value
     }
-
 }
 
 fn to_matter_err(err: anyhow::Error) -> Error {
