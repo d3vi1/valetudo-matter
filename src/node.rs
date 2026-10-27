@@ -6,8 +6,9 @@ use anyhow::Context;
 use log::debug;
 use rand::RngCore;
 use rs_matter::{
-    MATTER_PORT, Matter, clusters, devices,
+    MATTER_PORT, Matter, clusters,
     crypto::{Crypto, default_crypto},
+    devices,
     dm::{
         Async, AsyncHandler, AsyncMetadata, Cluster, DataModel, Dataver, DeviceType, EmptyHandler,
         Endpoint, EpClMatcher, IMBuffer, Node,
@@ -17,7 +18,7 @@ use rs_matter::{
         },
         devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_COMM},
         endpoints,
-        events::NoEvents,
+        events::Events,
         networks::{SysNetifs, eth::EthNetwork},
         subscriptions::Subscriptions,
     },
@@ -64,7 +65,23 @@ pub(crate) async fn run(
 
     let buffers = PooledBuffers::<10, IMBuffer>::new(0);
     let subscriptions = Subscriptions::<64>::new();
-    let events = NoEvents::new_default();
+    let events = Events::<1024>::new_default();
+    let rvc_clusters = rvc_clusters(
+        device.supports_clean_modes(),
+        device
+            .capabilities
+            .contains(crate::device::Capability::MapSegmentationCapability),
+    );
+    let endpoints = [
+        NODE.endpoints[0].clone(),
+        Endpoint {
+            clusters: &rvc_clusters,
+            ..NODE.endpoints[1].clone()
+        },
+    ];
+    let node = Node {
+        endpoints: &endpoints,
+    };
 
     let dm = DataModel::new(
         &matter,
@@ -72,7 +89,7 @@ pub(crate) async fn run(
         &buffers,
         &subscriptions,
         &events,
-        dm_handler(rng, device),
+        dm_handler(node, rng, device),
         SharedKvBlobStore::new(kv, kv_buf),
         SharedNetworks::new(EthNetwork::new_default()),
     );
@@ -112,9 +129,7 @@ pub(crate) async fn run(
     };
 
     let mdns = BuiltinMdnsResponder::new(&matter, &crypto);
-    let mut mdns = pin!(mdns.run(
-        &mdns_socket, &mdns_socket, &host, ipv4_iface, iface.index,
-    ));
+    let mut mdns = pin!(mdns.run(&mdns_socket, &mdns_socket, &host, ipv4_iface, iface.index,));
 
     // Matter transport.
     let socket = smol::Async::<UdpSocket>::bind(MATTER_SOCKET_BIND_ADDR)?;
@@ -123,26 +138,35 @@ pub(crate) async fn run(
     if !matter.is_commissioned() {
         matter.print_standard_qr_text(DiscoveryCapabilities::IP)?;
         matter.print_standard_qr_code(QrTextType::Unicode, DiscoveryCapabilities::IP)?;
-        matter.open_basic_comm_window(
-            MAX_COMM_WINDOW_TIMEOUT_SECS,
-            &crypto,
-            dm.change_notify(),
-        )?;
+        matter.open_basic_comm_window(MAX_COMM_WINDOW_TIMEOUT_SECS, &crypto, dm.change_notify())?;
     }
 
-    let mut dm = pin!(dm.run());
     let mut monitor = pin!(async {
-        device.monitor_status(
-            &subscriptions,
-            RUN_MODE_CLUSTER.id,
-            CLEAN_MODE_CLUSTER.id,
-            OPERATIONAL_STATE_CLUSTER.id,
-        ).await;
+        future::zip(
+            device.monitor_status(
+                &subscriptions,
+                RUN_MODE_CLUSTER.id,
+                CLEAN_MODE_CLUSTER.id,
+                OPERATIONAL_STATE_CLUSTER.id,
+            ),
+            async {
+                loop {
+                    device.flush_events(&dm);
+                    smol::Timer::after(std::time::Duration::from_millis(100)).await;
+                }
+            },
+        )
+        .await;
         Ok::<(), rs_matter::error::Error>(())
     });
+    let mut dm_run = pin!(dm.run());
 
     let fut = try_zip5(
-        &mut transport, &mut mdns, &mut respond, &mut dm, &mut monitor,
+        &mut transport,
+        &mut mdns,
+        &mut respond,
+        &mut dm_run,
+        &mut monitor,
     );
     Ok(fut.await?)
 }
@@ -198,11 +222,12 @@ const NODE: Node<'static> = Node {
 };
 
 fn dm_handler<'a>(
+    node: Node<'a>,
     mut rand: impl RngCore + Copy,
     device: &'a Device,
 ) -> impl AsyncMetadata + AsyncHandler + 'a {
     (
-        NODE,
+        node,
         endpoints::with_eth_sys(
             &false,
             &(),
@@ -235,4 +260,35 @@ fn dm_handler<'a>(
                 ),
         ),
     )
+}
+
+fn rvc_clusters(clean_modes: bool, segments: bool) -> Vec<Cluster<'static>> {
+    NODE.endpoints[1]
+        .clusters
+        .iter()
+        .filter(|cluster| {
+            (cluster.id != CLEAN_MODE_CLUSTER.id || clean_modes)
+                && (cluster.id != SERVICE_AREA_CLUSTER.id || segments)
+        })
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    #[test]
+    fn optional_clusters_are_omitted_without_usable_capabilities() {
+        let minimal = rvc_clusters(false, false);
+        assert!(minimal.iter().any(|c| c.id == RUN_MODE_CLUSTER.id));
+        assert!(minimal.iter().any(|c| c.id == OPERATIONAL_STATE_CLUSTER.id));
+        assert!(
+            !minimal
+                .iter()
+                .any(|c| c.id == CLEAN_MODE_CLUSTER.id || c.id == SERVICE_AREA_CLUSTER.id)
+        );
+        let complete = rvc_clusters(true, true);
+        assert!(complete.iter().any(|c| c.id == CLEAN_MODE_CLUSTER.id));
+        assert!(complete.iter().any(|c| c.id == SERVICE_AREA_CLUSTER.id));
+    }
 }

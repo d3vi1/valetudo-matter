@@ -7,10 +7,7 @@ use rs_matter::{
 
 use rs_matter::dm::clusters::decl::{self as decl, rvc_clean_mode};
 
-use crate::{
-    device::{Device, Preset},
-    handlers::to_matter_err,
-};
+use crate::device::{Device, Preset};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
 #[repr(u8)]
@@ -46,7 +43,7 @@ impl From<CleanMode> for Preset {
 impl rvc_clean_mode::ClusterAsyncHandler for Device {
     const CLUSTER: rs_matter::dm::Cluster<'static> = rvc_clean_mode::FULL_CLUSTER
         .with_revision(5)
-        .with_features(20) // DIRECTMODECH
+        .with_features(1 << 20) // DIRECTMODECH
         .with_attrs(rs_matter::with!(required));
 
     fn dataver(&self) -> u32 {
@@ -90,28 +87,44 @@ impl rvc_clean_mode::ClusterAsyncHandler for Device {
         &self,
         _ctx: impl rs_matter::dm::ReadContext,
     ) -> Result<u8, rs_matter::error::Error> {
-        let mode: CleanMode = self.current_preset.get().into();
+        let mode: CleanMode = self
+            .current_preset
+            .get()
+            .ok_or(ErrorCode::InvalidAction)?
+            .into();
         Ok(mode.into())
     }
 
     async fn handle_change_to_mode<P: rs_matter::tlv::TLVBuilderParent>(
         &self,
-        _ctx: impl rs_matter::dm::InvokeContext,
+        ctx: impl rs_matter::dm::InvokeContext,
         request: rvc_clean_mode::ChangeToModeRequest<'_>,
         response: rvc_clean_mode::ChangeToModeResponseBuilder<P>,
     ) -> Result<P, rs_matter::error::Error> {
-        let new_mode: CleanMode = request
-            .new_mode()?
-            .try_into()
-            .map_err(|_| Error::new(ErrorCode::ConstraintError))?;
+        let Some(_command) = self.try_command() else {
+            return response
+                .status(2)?
+                .status_text(Some("Another control command is in progress"))?
+                .end();
+        };
 
+        let Some(new_mode) = CleanMode::try_from(request.new_mode()?).ok() else {
+            return response.status(1)?.status_text(Some(""))?.end();
+        };
         let preset: Preset = new_mode.into();
         if !self.cleaning_presets.contains(preset) {
-            return Err(Error::new(ErrorCode::ConstraintError));
+            return response.status(1)?.status_text(Some(""))?.end();
         }
-
-        self.set_preset(preset).await.map_err(to_matter_err)?;
-        self.current_preset.set(preset);
+        if self.current_preset.get() != Some(preset) {
+            if let Err(error) = self.set_preset(preset).await {
+                log::warn!("Clean mode command failed: {error:#}");
+                return response
+                    .status(2)?
+                    .status_text(Some("Valetudo rejected or did not confirm command"))?
+                    .end();
+            }
+            self.current_preset.set_notify(Some(preset), &ctx);
+        }
 
         response.status(0)?.status_text(None)?.end()
     }
