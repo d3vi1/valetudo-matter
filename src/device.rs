@@ -48,7 +48,8 @@ pub(crate) struct Device {
     pub(crate) current_preset: VersionedCell<Option<Preset>>,
     pub(crate) current_state: VersionedCell<DeviceState>,
     pub(crate) identify_time: VersionedCell<u16>,
-    pub(crate) segments: Vec<MapSegment>,
+    pub(crate) segments: RefCell<Vec<MapSegment>>,
+    pub(crate) selection_invalidated: Cell<bool>,
     pub(crate) battery: VersionedCell<BatteryState>,
     pub(crate) cycle_mode: VersionedCell<CycleMode>,
     pub(crate) cycle_known: Cell<bool>,
@@ -174,7 +175,8 @@ impl Device {
             current_preset: VersionedCell::new(default_preset, &mut thread_rng()),
             current_state,
             identify_time: VersionedCell::new(0, &mut thread_rng()),
-            segments,
+            segments: RefCell::new(Self::normalize_segments(segments)),
+            selection_invalidated: Cell::new(false),
             battery: VersionedCell::new(
                 attributes
                     .iter()
@@ -637,6 +639,10 @@ impl Device {
     }
 
     pub(crate) async fn start_cleaning(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.selection_invalidated.get(),
+            "Selected rooms changed; explicitly select rooms again before starting"
+        );
         self.ensure_known_status()?;
         let selected = self.selected_areas.borrow().clone();
         if selected.is_empty() {
@@ -652,17 +658,19 @@ impl Device {
                 .iter()
                 .filter_map(|area_id| {
                     self.segments
+                        .borrow()
                         .iter()
                         .find(|s| segment_area_id(s) == Some(*area_id))
-                        .map(|s| format!(r#""{}""#, s.id))
+                        .map(|s| s.id.clone())
                 })
                 .collect();
 
             debug!("starting segment clean for segments: {segment_ids:?}");
-            let body = format!(
-                r#"{{"action": "start_segment_action", "segment_ids": [{}], "iterations": 1}}"#,
-                segment_ids.join(", "),
+            anyhow::ensure!(
+                segment_ids.len() == selected.len(),
+                "Selected room is unavailable"
             );
+            let body = serde_json::json!({"action": "start_segment_action", "segment_ids": segment_ids, "iterations": 1}).to_string();
             self.client
                 .put("/api/v2/robot/capabilities/MapSegmentationCapability", body)
                 .await
@@ -730,9 +738,22 @@ impl Device {
     }
 }
 
-/// Map a Valetudo segment to a Matter area ID by parsing the string ID.
+/// Preserve numeric IDs; deterministically map nonnumeric IDs across restarts.
 pub(crate) fn segment_area_id(segment: &MapSegment) -> Option<u32> {
-    segment.id.parse().ok()
+    if segment.id.is_empty() {
+        return None;
+    }
+    Some(segment.id.parse().unwrap_or_else(|_| {
+        // Stable across restarts, list reordering and room renaming. Collision
+        // groups (including numeric/hash collisions) are excluded by normalization.
+        segment
+            .id
+            .as_bytes()
+            .iter()
+            .fold(0x811c9dc5u32, |hash, byte| {
+                (hash ^ u32::from(*byte)).wrapping_mul(0x01000193)
+            })
+    }))
 }
 
 fn preset_from_str(s: &str) -> Option<Preset> {
@@ -860,10 +881,10 @@ impl OperationalEvent {
 }
 
 #[cfg(test)]
-mod cycle_tests {
+pub(crate) mod cycle_tests {
     use super::*;
 
-    pub(super) fn device() -> Device {
+    pub(crate) fn device() -> Device {
         let executor = Box::leak(Box::new(smol::LocalExecutor::new()));
         Device {
             client: ValetudoClient::new(executor, "http://127.0.0.1:1".parse().unwrap()),
@@ -873,7 +894,8 @@ mod cycle_tests {
             current_preset: VersionedCell::new(None, &mut thread_rng()),
             current_state: VersionedCell::new(DeviceState::default(), &mut thread_rng()),
             identify_time: VersionedCell::new(0, &mut thread_rng()),
-            segments: Vec::new(),
+            segments: RefCell::new(Vec::new()),
+            selection_invalidated: Cell::new(false),
             battery: VersionedCell::new(BatteryState::default(), &mut thread_rng()),
             cycle_known: Cell::new(true),
             resume_context_trusted: Cell::new(false),

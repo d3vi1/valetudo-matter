@@ -953,7 +953,7 @@ fn optional_capability_failures_do_not_abort_basic_rvc_initialization() {
     assert!(!device.capabilities.contains(Capability::Unknown));
     assert!(!device.supports_clean_modes());
     assert_eq!(device.current_preset.get(), None);
-    assert!(device.segments.is_empty());
+    assert!(device.segments.borrow().is_empty());
     assert!(device.ensure_known_status().is_ok());
     server.join().unwrap();
 }

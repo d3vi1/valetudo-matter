@@ -143,18 +143,21 @@ pub(crate) async fn run(
 
     let mut monitor = pin!(async {
         future::zip(
-            device.monitor_status(
-                &subscriptions,
-                RUN_MODE_CLUSTER.id,
-                CLEAN_MODE_CLUSTER.id,
-                OPERATIONAL_STATE_CLUSTER.id,
+            device.monitor_segments(&subscriptions),
+            future::zip(
+                device.monitor_status(
+                    &subscriptions,
+                    RUN_MODE_CLUSTER.id,
+                    CLEAN_MODE_CLUSTER.id,
+                    OPERATIONAL_STATE_CLUSTER.id,
+                ),
+                async {
+                    loop {
+                        device.flush_events(&dm);
+                        smol::Timer::after(std::time::Duration::from_millis(100)).await;
+                    }
+                },
             ),
-            async {
-                loop {
-                    device.flush_events(&dm);
-                    smol::Timer::after(std::time::Duration::from_millis(100)).await;
-                }
-            },
         )
         .await;
         Ok::<(), rs_matter::error::Error>(())
