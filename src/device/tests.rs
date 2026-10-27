@@ -15,12 +15,14 @@ use rs_matter::{
 #[derive(Default)]
 struct Context {
     notifications: Cell<usize>,
+    cluster_paths: RefCell<Vec<(u16,u32)>>,
 }
 impl dm::AttrChangeNotifier for Context {
     fn notify_attr_changed(&self, _: u16, _: u32, _: u32) {
         self.notifications.set(self.notifications.get() + 1);
     }
-    fn notify_cluster_changed(&self, _: u16, _: u32) {
+    fn notify_cluster_changed(&self, endpoint: u16, cluster: u32) {
+        self.cluster_paths.borrow_mut().push((endpoint,cluster));
         self.notifications.set(self.notifications.get() + 1);
     }
     fn notify_endpoint_changed(&self, _: u16) {
@@ -1736,4 +1738,152 @@ fn actual_start_ack_and_continuous_observation_control_encoded_timing_presence()
         }
         server.join().unwrap();
     }
+}
+
+#[test]
+fn power_source_attributes_and_endpoint_list_follow_robot_api_not_host() {
+    use crate::power_source::PowerSource;
+    use rs_matter::dm::clusters::decl::power_source::{
+        BatChargeLevelEnum, BatChargeStateEnum, ClusterHandler, PowerSourceStatusEnum,
+    };
+    let device = super::cycle_tests::device();
+    let ctx = Context::default();
+    device.apply_attributes(
+        &[StateAttribute::BatteryStateAttribute {
+            level: Some(73.5),
+            flag: BatteryFlag::Discharging,
+        }],
+        &ctx,
+        0x54,
+        0x55,
+        0x61,
+    );
+    assert!(ctx.cluster_paths.borrow().contains(&(2, 0x2f)));
+    assert!(ctx.cluster_paths.borrow().contains(&(1, 0x61)));
+    for native in [false, true] {
+        let power = PowerSource::new(&device, native);
+        assert_eq!(
+            power.bat_percent_remaining(&ctx).unwrap(),
+            Some(147u8).into()
+        );
+        assert_eq!(
+            power.bat_charge_level(&ctx).unwrap(),
+            BatChargeLevelEnum::OK
+        );
+        assert_eq!(
+            power.bat_charge_state(&ctx).unwrap(),
+            BatChargeStateEnum::IsNotCharging
+        );
+        assert_eq!(power.status(&ctx).unwrap(), PowerSourceStatusEnum::Active);
+        let mut bytes = [0; 64];
+        let mut writer = WriteBuf::new(&mut bytes);
+        let builder = rs_matter::tlv::ToTLVArrayBuilder::new(
+            TLVWriteParent::new((), &mut writer),
+            &TLVTag::Anonymous,
+        )
+        .unwrap();
+        power
+            .endpoint_list(&ctx, dm::ArrayAttributeRead::ReadAll(builder))
+            .unwrap();
+        let endpoints = TLVElement::new(writer.as_slice())
+            .array()
+            .unwrap()
+            .iter()
+            .map(|x| x.unwrap().u16().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(endpoints, if native { vec![0, 1, 2] } else { vec![1, 2] });
+    }
+    let power = PowerSource::new(&device, true);
+    let version = power.dataver();
+    device.apply_attributes(
+        &[StateAttribute::BatteryStateAttribute {
+            level: Some(100.0),
+            flag: BatteryFlag::Charged,
+        }],
+        &ctx,
+        0x54,
+        0x55,
+        0x61,
+    );
+    assert_ne!(version, power.dataver());
+    assert_eq!(
+        power.bat_charge_state(&ctx).unwrap(),
+        BatChargeStateEnum::IsAtFullCharge
+    );
+    assert_eq!(
+        power.status(&ctx).unwrap(),
+        PowerSourceStatusEnum::Unspecified
+    );
+    ctx.cluster_paths.borrow_mut().clear();
+    device.apply_snapshot(&[], &ctx, 0x54, 0x55, 0x61);
+    assert_eq!(
+        power.bat_percent_remaining(&ctx).unwrap(),
+        None::<u8>.into()
+    );
+    assert!(power.bat_charge_level(&ctx).is_err());
+    assert_eq!(
+        power.bat_charge_state(&ctx).unwrap(),
+        BatChargeStateEnum::Unknown
+    );
+    assert!(ctx.cluster_paths.borrow().contains(&(2, 0x2f)));
+}
+
+#[test]
+fn power_source_serialized_percent_does_not_leak_raw_updates_on_flag_reports() {
+    use crate::power_source::PowerSource;
+    use rs_matter::{
+        dm::clusters::decl::power_source::{BatChargeStateEnum, ClusterHandler},
+        tlv::ToTLV,
+    };
+    let device = super::cycle_tests::device();
+    let power = PowerSource::new(&device, true);
+    let ctx = Context::default();
+    let t = std::time::Instant::now();
+    let first = BatteryState {
+        half_percent: Some(100),
+        flag: BatteryFlag::Discharging,
+    };
+    device.battery.set(first);
+    device.power_battery.update(first, t, &ctx);
+    let next = BatteryState {
+        half_percent: Some(150),
+        flag: BatteryFlag::Charging,
+    };
+    device.battery.set(next);
+    device
+        .power_battery
+        .update(next, t + std::time::Duration::from_secs(1), &ctx);
+    assert_eq!(device.battery.get(), next); // RVC continues to consume immediate raw state.
+    assert_eq!(
+        power.bat_charge_state(&ctx).unwrap(),
+        BatChargeStateEnum::IsCharging
+    );
+    for (now, expected) in [(1, 100), (9, 100), (10, 150)] {
+        device.power_battery.update(
+            device.battery.get(),
+            t + std::time::Duration::from_secs(now),
+            &ctx,
+        );
+        let mut bytes = [0; 32];
+        let mut writer = WriteBuf::new(&mut bytes);
+        power
+            .bat_percent_remaining(&ctx)
+            .unwrap()
+            .to_tlv(&TLVTag::Anonymous, &mut writer)
+            .unwrap();
+        assert_eq!(TLVElement::new(writer.as_slice()).u8().unwrap(), expected);
+    }
+    device.power_battery.update(
+        BatteryState::default(),
+        t + std::time::Duration::from_secs(11),
+        &ctx,
+    );
+    let mut bytes = [0; 32];
+    let mut writer = WriteBuf::new(&mut bytes);
+    power
+        .bat_percent_remaining(&ctx)
+        .unwrap()
+        .to_tlv(&TLVTag::Anonymous, &mut writer)
+        .unwrap();
+    TLVElement::new(writer.as_slice()).null().unwrap();
 }

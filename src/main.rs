@@ -14,6 +14,7 @@ mod identity;
 mod net;
 mod node;
 mod persistence_path;
+mod power_source;
 
 const DEFAULT_VALETUDO_URI: &str = "http://localhost:80";
 

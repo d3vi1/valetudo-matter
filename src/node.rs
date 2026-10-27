@@ -47,6 +47,8 @@ pub(crate) async fn run(
 ) -> anyhow::Result<()> {
     let identity = crate::identity::Identity::load(&device.client).await?;
     let basic_info = identity.basic_info();
+    let native = std::env::var("VALETUDO_MATTER_NATIVE_DIAGNOSTICS").as_deref() == Ok("1");
+    let power = crate::power_source::PowerSource::new(device, native);
     let mut matter = Matter::new(
         &basic_info,
         TEST_DEV_COMM,
@@ -72,13 +74,7 @@ pub(crate) async fn run(
             .capabilities
             .contains(crate::device::Capability::MapSegmentationCapability),
     );
-    let endpoints = [
-        NODE.endpoints[0].clone(),
-        Endpoint {
-            clusters: &rvc_clusters,
-            ..NODE.endpoints[1].clone()
-        },
-    ];
+    let endpoints = compose_endpoints(&rvc_clusters, device.battery.get().half_percent.is_some());
     let node = Node {
         endpoints: &endpoints,
     };
@@ -89,7 +85,7 @@ pub(crate) async fn run(
         &buffers,
         &subscriptions,
         &events,
-        dm_handler(node, rng, device),
+        dm_handler(node, rng, device, &power),
         SharedKvBlobStore::new(kv, kv_buf),
         SharedNetworks::new(EthNetwork::new_default()),
     );
@@ -153,6 +149,7 @@ pub(crate) async fn run(
                 ),
                 async {
                     loop {
+                        device.power_battery.update(device.battery.get(), std::time::Instant::now(), &subscriptions);
                         device.flush_events(&dm);
                         smol::Timer::after(std::time::Duration::from_millis(100)).await;
                     }
@@ -228,6 +225,7 @@ fn dm_handler<'a>(
     node: Node<'a>,
     mut rand: impl RngCore + Copy,
     device: &'a Device,
+    power: &'a crate::power_source::PowerSource<'a>,
 ) -> impl AsyncMetadata + AsyncHandler + 'a {
     (
         node,
@@ -237,6 +235,16 @@ fn dm_handler<'a>(
             &SysNetifs,
             rand,
             EmptyHandler
+                .chain(
+                    EpClMatcher::new(Some(2), Some(POWER_SOURCE_CLUSTER.id)),
+                    Async(rs_matter::dm::clusters::decl::power_source::HandlerAdaptor(
+                        power,
+                    )),
+                )
+                .chain(
+                    EpClMatcher::new(Some(2), Some(desc::DescHandler::CLUSTER.id)),
+                    Async(desc::DescHandler::new(Dataver::new_rand(&mut rand)).adapt()),
+                )
                 .chain(
                     EpClMatcher::new(Some(1), Some(desc::DescHandler::CLUSTER.id)),
                     Async(desc::DescHandler::new(Dataver::new_rand(&mut rand)).adapt()),
@@ -293,5 +301,52 @@ mod metadata_tests {
         let complete = rvc_clusters(true, true);
         assert!(complete.iter().any(|c| c.id == CLEAN_MODE_CLUSTER.id));
         assert!(complete.iter().any(|c| c.id == SERVICE_AREA_CLUSTER.id));
+    }
+}
+
+const POWER_SOURCE_CLUSTER: Cluster<'static> = <crate::power_source::PowerSource<'_> as rs_matter::dm::clusters::decl::power_source::ClusterHandler>::CLUSTER;
+
+fn compose_endpoints<'a>(rvc: &'a [Cluster<'a>], battery_available: bool) -> Vec<Endpoint<'a>> {
+    let mut endpoints = vec![
+        NODE.endpoints[0].clone(),
+        Endpoint {
+            clusters: rvc,
+            ..NODE.endpoints[1].clone()
+        },
+    ];
+    // A charging flag alone cannot supply the required coarse charge assessment.
+    // Keep topology stable after initialization; unavailable later values are unknown/null.
+    if battery_available {
+        endpoints.push(Endpoint {
+            id: 2,
+            device_types: &[DeviceType {
+                dtype: 0x0011,
+                drev: 1,
+            }],
+            clusters: &[desc::DescHandler::CLUSTER, POWER_SOURCE_CLUSTER],
+        });
+    }
+    endpoints
+}
+
+#[cfg(test)]
+mod power_endpoint_tests {
+    use super::*;
+    #[test]
+    fn battery_endpoint_is_optional_and_preserves_rvc_composition() {
+        let rvc = rvc_clusters(false, false);
+        let absent = compose_endpoints(&rvc, false);
+        assert_eq!(absent.iter().map(|e| e.id).collect::<Vec<_>>(), vec![0, 1]);
+        let present = compose_endpoints(&rvc, true);
+        assert_eq!(
+            present.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(present[2].device_types[0].dtype, 0x0011);
+        assert_eq!(
+            present[2].clusters.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![desc::DescHandler::CLUSTER.id, 0x2f]
+        );
+        assert_eq!(present[1].clusters.len(), absent[1].clusters.len());
     }
 }

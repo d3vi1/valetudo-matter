@@ -53,6 +53,7 @@ pub(crate) struct Device {
     pub(crate) segments: RefCell<Vec<MapSegment>>,
     pub(crate) selection_invalidated: Cell<bool>,
     pub(crate) battery: VersionedCell<BatteryState>,
+    pub(crate) power_battery: crate::power_source::PowerBattery,
     pub(crate) cycle_mode: VersionedCell<CycleMode>,
     pub(crate) cycle_known: Cell<bool>,
     cycle_timing: RefCell<CycleTiming>,
@@ -191,6 +192,18 @@ impl Device {
                     })
                     .unwrap_or_default(),
                 &mut thread_rng(),
+            ),
+            power_battery: crate::power_source::PowerBattery::new(
+                attributes
+                    .iter()
+                    .find_map(|attr| match attr {
+                        StateAttribute::BatteryStateAttribute { level, flag } => {
+                            Some(BatteryState::from_api(*level, *flag))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                std::time::Instant::now(),
             ),
             resume_context_trusted: Cell::new(
                 matches!(*value, StatusValue::Cleaning | StatusValue::Returning)
@@ -399,8 +412,11 @@ impl Device {
             match attr {
                 state::StateAttribute::BatteryStateAttribute { level, flag } => {
                     let next = BatteryState::from_api(*level, *flag);
+                    self.power_battery
+                        .update(next, std::time::Instant::now(), notify);
                     if next != self.battery.get() {
                         self.battery.set(next);
+
                         self.current_state.dataver_changed();
                         notify.notify_cluster_changed(1, operational_state_cluster);
                     }
@@ -948,6 +964,10 @@ pub(crate) mod cycle_tests {
             segments: RefCell::new(Vec::new()),
             selection_invalidated: Cell::new(false),
             battery: VersionedCell::new(BatteryState::default(), &mut thread_rng()),
+            power_battery: crate::power_source::PowerBattery::new(
+                BatteryState::default(),
+                std::time::Instant::now(),
+            ),
             cycle_known: Cell::new(true),
             cycle_timing: RefCell::new(CycleTiming::default()),
             resume_context_trusted: Cell::new(false),
