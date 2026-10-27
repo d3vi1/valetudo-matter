@@ -425,9 +425,9 @@ mod provider_tests {
         assert!(diag.uptime_value() < 5);
     }
     #[test]
-    fn remote_mode_or_transport_mismatch_never_reports_robot_interface_as_local() {
-        for (native, ip) in [(true, "198.51.100.1")] {
-            let diag = GeneralDiagnostics::new(native, ip.parse().unwrap(), 7);
+    fn transport_mismatch_never_reports_robot_interface_as_local() {
+        {
+            let diag = GeneralDiagnostics::new(true, "198.51.100.1".parse().unwrap(), 7);
             diag.update(Some(network()), &Notify::default());
             assert!(
                 diag.netifs(&mut |_| panic!("wrong node interface"))

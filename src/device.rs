@@ -417,8 +417,10 @@ impl Device {
         } else {
             "operation_mode"
         };
-        if !attrs.iter().any(|attr| matches!(attr, StateAttribute::PresetSelectionStateAttribute { r#type, .. } if r#type == preset_type)) {
-            if self.current_preset.replace(None).is_some() { notify.notify_cluster_changed(1, clean_mode_cluster); }
+        if !attrs.iter().any(|attr| matches!(attr, StateAttribute::PresetSelectionStateAttribute { r#type, .. } if r#type == preset_type))
+            && self.current_preset.replace(None).is_some()
+        {
+            notify.notify_cluster_changed(1, clean_mode_cluster);
         }
         self.apply_attributes(
             &missing,

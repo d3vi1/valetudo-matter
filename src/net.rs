@@ -118,10 +118,10 @@ impl Netif {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = socket;
-            return Err(io::Error::new(
+            Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Native interface binding requires Linux",
-            ));
+            ))
         }
         #[cfg(target_os = "linux")]
         {

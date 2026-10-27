@@ -16,6 +16,12 @@ startup events, persistent event numbers and delayed command acknowledgements on
 the S5 kernel. TimeSnapshot has not been invoked through an external controller.
 No Matter certification or cross-model hardware coverage is claimed.
 
+Public checkout validation on 2026-10-27: 116 host tests passed; formatting,
+strict Clippy on macOS and the ARMv7 Linux target, shell syntax and ARMv7 musl
+release compilation passed. Cross-target Clippy/build checks are not execution
+of the test suite on ARM. The public branding and portable deployment changes
+have not been redeployed for another hardware qualification run.
+
 ## API and capability boundaries
 
 - Native identity requires manufacturer/model from `/api/v2/robot`.
