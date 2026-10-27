@@ -1335,3 +1335,323 @@ fn fan_modes_require_two_recognized_options_and_optional_api_failures_are_safe()
         server.join().unwrap();
     }
 }
+
+#[test]
+fn mapping_capability_advertises_mode_and_uses_mapping_api_without_unsafe_resume() {
+    use rs_matter::dm::ArrayAttributeRead;
+    let (url, server) = serve(vec![
+        Reply {
+            method: "GET",
+            path: "/api/v2/robot/capabilities",
+            status: 200,
+            body: r#"["BasicControlCapability","MappingPassCapability"]"#,
+            expected: None,
+        },
+        Reply {
+            method: "GET",
+            path: "/api/v2/robot/state/attributes",
+            status: 200,
+            body: r#"[{"__class":"StatusStateAttribute","value":"idle","flag":"none"}]"#,
+            expected: None,
+        },
+        Reply {
+            method: "PUT",
+            path: "/api/v2/robot/capabilities/MappingPassCapability",
+            status: 200,
+            body: "{}",
+            expected: Some(serde_json::json!({"action":"start_mapping"})),
+        },
+        Reply {
+            method: "PUT",
+            path: "/api/v2/robot/capabilities/BasicControlCapability",
+            status: 200,
+            body: "{}",
+            expected: Some(serde_json::json!({"action":"stop"})),
+        },
+    ]);
+    let executor = Box::leak(Box::new(smol::LocalExecutor::new()));
+    smol::block_on(executor.run(async {
+        let device = Device::init(ValetudoClient::new(executor, url.parse().unwrap()))
+            .await
+            .unwrap();
+        let mut buffer = [0; 512];
+        let mut writer = WriteBuf::new(&mut buffer);
+        let builder = rs_matter::dm::clusters::decl::globals::ModeOptionStructArrayBuilder::new(
+            TLVWriteParent::new((), &mut writer),
+            &TLVTag::Anonymous,
+        )
+        .unwrap();
+        rvc_run_mode::ClusterAsyncHandler::supported_modes(
+            &device,
+            Context::default(),
+            ArrayAttributeRead::ReadAll(builder),
+        )
+        .await
+        .unwrap();
+        let entries = TLVElement::new(writer.as_slice())
+            .array()
+            .unwrap()
+            .iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries[0]
+                .structure()
+                .unwrap()
+                .find_ctx(1)
+                .unwrap()
+                .u8()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            entries[1]
+                .structure()
+                .unwrap()
+                .find_ctx(1)
+                .unwrap()
+                .u8()
+                .unwrap(),
+            1
+        );
+        let mapping = entries[2].structure().unwrap();
+        assert_eq!(mapping.find_ctx(1).unwrap().u8().unwrap(), 2);
+        assert_eq!(mapping.find_ctx(0).unwrap().utf8().unwrap(), "Mapping");
+        let tags = mapping
+            .find_ctx(2)
+            .unwrap()
+            .array()
+            .unwrap()
+            .iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            tags[0]
+                .structure()
+                .unwrap()
+                .find_ctx(1)
+                .unwrap()
+                .u16()
+                .unwrap(),
+            0x4002
+        );
+
+        let mut input = [0; 32];
+        let length = mode_request(&mut input, 2);
+        let request = TLVElement::new(&input[..length]);
+        let mut writer = WriteBuf::new(&mut buffer);
+        let response = rvc_run_mode::ChangeToModeResponseBuilder::new(
+            TLVWriteParent::new((), &mut writer),
+            &TLVTag::Anonymous,
+        )
+        .unwrap();
+        rvc_run_mode::ClusterAsyncHandler::handle_change_to_mode(
+            &device,
+            Context::default(),
+            rvc_run_mode::ChangeToModeRequest::from_tlv(&request).unwrap(),
+            response,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            TLVElement::new(writer.as_slice())
+                .structure()
+                .unwrap()
+                .find_ctx(0)
+                .unwrap()
+                .u8()
+                .unwrap(),
+            0
+        );
+        assert_eq!(device.cycle_mode.get(), CycleMode::Mapping);
+        device.apply_attributes(
+            &[StateAttribute::StatusStateAttribute {
+                value: StatusValue::Moving,
+                flag: StatusFlag::Mapping,
+                error: None,
+            }],
+            &(),
+            0x54,
+            0x55,
+            0x61,
+        );
+        assert_eq!(
+            rvc_run_mode::ClusterAsyncHandler::current_mode(&device, Context::default())
+                .await
+                .unwrap(),
+            2
+        );
+        let mut writer = WriteBuf::new(&mut buffer);
+        let response = rvc_operational_state::OperationalCommandResponseBuilder::new(
+            TLVWriteParent::new((), &mut writer),
+            &TLVTag::Anonymous,
+        )
+        .unwrap();
+        rvc_operational_state::ClusterAsyncHandler::handle_pause(
+            &device,
+            Context::default(),
+            response,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            TLVElement::new(writer.as_slice())
+                .structure()
+                .unwrap()
+                .find_ctx(0)
+                .unwrap()
+                .structure()
+                .unwrap()
+                .find_ctx(0)
+                .unwrap()
+                .u8()
+                .unwrap(),
+            3
+        );
+        device.apply_attributes(
+            &[StateAttribute::StatusStateAttribute {
+                value: StatusValue::Paused,
+                flag: StatusFlag::Resumable,
+                error: None,
+            }],
+            &(),
+            0x54,
+            0x55,
+            0x61,
+        );
+        let mut writer = WriteBuf::new(&mut buffer);
+        let response = rvc_operational_state::OperationalCommandResponseBuilder::new(
+            TLVWriteParent::new((), &mut writer),
+            &TLVTag::Anonymous,
+        )
+        .unwrap();
+        rvc_operational_state::ClusterAsyncHandler::handle_resume(
+            &device,
+            Context::default(),
+            response,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            TLVElement::new(writer.as_slice())
+                .structure()
+                .unwrap()
+                .find_ctx(0)
+                .unwrap()
+                .structure()
+                .unwrap()
+                .find_ctx(0)
+                .unwrap()
+                .u8()
+                .unwrap(),
+            1
+        );
+        // Neither unsupported Pause nor Resume sends an HTTP command; next is Stop.
+        let length = mode_request(&mut input, 0);
+        let request = TLVElement::new(&input[..length]);
+        let mut writer = WriteBuf::new(&mut buffer);
+        let response = rvc_run_mode::ChangeToModeResponseBuilder::new(
+            TLVWriteParent::new((), &mut writer),
+            &TLVTag::Anonymous,
+        )
+        .unwrap();
+        rvc_run_mode::ClusterAsyncHandler::handle_change_to_mode(
+            &device,
+            Context::default(),
+            rvc_run_mode::ChangeToModeRequest::from_tlv(&request).unwrap(),
+            response,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            TLVElement::new(writer.as_slice())
+                .structure()
+                .unwrap()
+                .find_ctx(0)
+                .unwrap()
+                .u8()
+                .unwrap(),
+            0
+        );
+        assert_eq!(device.cycle_mode.get(), CycleMode::Idle);
+        assert_eq!(
+            *device.pending_events.borrow(),
+            [OperationalEvent::Completed(0)]
+        );
+    }));
+    server.join().unwrap();
+}
+
+#[test]
+fn rejected_mapping_api_command_does_not_create_phantom_cycle_or_completion() {
+    let (url, server) = serve(vec![Reply {
+        method: "PUT",
+        path: "/api/v2/robot/capabilities/MappingPassCapability",
+        status: 503,
+        body: "{}",
+        expected: Some(serde_json::json!({"action":"start_mapping"})),
+    }]);
+    let executor = Box::leak(Box::new(smol::LocalExecutor::new()));
+    let mut device = super::cycle_tests::device();
+    device.client = ValetudoClient::new(executor, url.parse().unwrap());
+    device
+        .capabilities
+        .insert(Capability::MappingPassCapability);
+    smol::block_on(executor.run(async {
+        let mut input = [0; 32];
+        let length = mode_request(&mut input, 2);
+        let request = TLVElement::new(&input[..length]);
+        let mut output = [0; 128];
+        let mut writer = WriteBuf::new(&mut output);
+        let response = rvc_run_mode::ChangeToModeResponseBuilder::new(
+            TLVWriteParent::new((), &mut writer),
+            &TLVTag::Anonymous,
+        )
+        .unwrap();
+        rvc_run_mode::ClusterAsyncHandler::handle_change_to_mode(
+            &device,
+            Context::default(),
+            rvc_run_mode::ChangeToModeRequest::from_tlv(&request).unwrap(),
+            response,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            TLVElement::new(writer.as_slice())
+                .structure()
+                .unwrap()
+                .find_ctx(0)
+                .unwrap()
+                .u8()
+                .unwrap(),
+            2
+        );
+        assert_eq!(device.cycle_mode.get(), CycleMode::Idle);
+        assert!(device.pending_events.borrow().is_empty());
+    }));
+    server.join().unwrap();
+}
+
+#[test]
+fn mapping_state_without_mapping_capability_is_not_published_as_a_selectable_mode() {
+    let device = super::cycle_tests::device();
+    device.apply_attributes(
+        &[StateAttribute::StatusStateAttribute {
+            value: StatusValue::Moving,
+            flag: StatusFlag::Mapping,
+            error: None,
+        }],
+        &(),
+        0x54,
+        0x55,
+        0x61,
+    );
+    assert!(
+        smol::block_on(rvc_run_mode::ClusterAsyncHandler::current_mode(
+            &device,
+            Context::default()
+        ))
+        .is_err()
+    );
+}

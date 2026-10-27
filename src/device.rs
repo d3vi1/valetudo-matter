@@ -620,6 +620,22 @@ impl Device {
         }
     }
 
+    pub(crate) async fn start_mapping(&self) -> anyhow::Result<()> {
+        self.ensure_known_status()?;
+        if !self
+            .capabilities
+            .contains(Capability::MappingPassCapability)
+        {
+            bail!("Mapping unsupported");
+        }
+        self.client
+            .put(
+                "/api/v2/robot/capabilities/MappingPassCapability",
+                r#"{"action":"start_mapping"}"#.into(),
+            )
+            .await
+    }
+
     pub(crate) async fn start_cleaning(&self) -> anyhow::Result<()> {
         self.ensure_known_status()?;
         let selected = self.selected_areas.borrow().clone();

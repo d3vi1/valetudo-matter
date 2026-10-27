@@ -9,7 +9,7 @@ use rs_matter::{
 use rs_matter::dm::clusters::decl::{self as decl, rvc_run_mode};
 
 use crate::{
-    device::{CycleMode, Device},
+    device::{Capability, CycleMode, Device},
     handlers::to_matter_err,
 };
 
@@ -18,6 +18,7 @@ use crate::{
 enum RunMode {
     Idle,
     Cleaning,
+    Mapping,
 }
 
 impl rvc_run_mode::ClusterAsyncHandler for Device {
@@ -44,17 +45,23 @@ impl rvc_run_mode::ClusterAsyncHandler for Device {
     ) -> Result<P, rs_matter::error::Error> {
         match builder {
             ArrayAttributeRead::ReadAll(mut builder) => {
-                for mode in supported_modes() {
+                for mode in supported_modes(
+                    self.capabilities
+                        .contains(Capability::MappingPassCapability),
+                ) {
                     builder = build_mode(builder.push()?, mode)?;
                 }
 
                 builder.end()
             }
             ArrayAttributeRead::ReadOne(index, builder) => {
-                let mode = supported_modes()
-                    .into_iter()
-                    .nth(index as usize)
-                    .ok_or(Error::new(ErrorCode::ConstraintError))?;
+                let mode = supported_modes(
+                    self.capabilities
+                        .contains(Capability::MappingPassCapability),
+                )
+                .into_iter()
+                .nth(index as usize)
+                .ok_or(Error::new(ErrorCode::ConstraintError))?;
 
                 build_mode(builder, mode)
             }
@@ -67,7 +74,12 @@ impl rvc_run_mode::ClusterAsyncHandler for Device {
         _ctx: impl rs_matter::dm::ReadContext,
     ) -> Result<u8, rs_matter::error::Error> {
         self.ensure_known_status().map_err(to_matter_err)?;
-        if !self.cycle_known.get() || self.cycle_mode.get() == CycleMode::Mapping {
+        if !self.cycle_known.get()
+            || (self.cycle_mode.get() == CycleMode::Mapping
+                && !self
+                    .capabilities
+                    .contains(Capability::MappingPassCapability))
+        {
             return Err(ErrorCode::InvalidAction.into());
         }
         Ok(self.cycle_mode.get() as u8)
@@ -87,7 +99,12 @@ impl rvc_run_mode::ClusterAsyncHandler for Device {
         };
 
         let new_mode = RunMode::try_from(request.new_mode()?).ok();
-        let Some(new_mode) = new_mode else {
+        let Some(new_mode) = new_mode.filter(|mode| {
+            *mode != RunMode::Mapping
+                || self
+                    .capabilities
+                    .contains(Capability::MappingPassCapability)
+        }) else {
             return response.status(1)?.status_text(Some(""))?.end();
         };
         if self.ensure_known_status().is_err() {
@@ -99,6 +116,7 @@ impl rvc_run_mode::ClusterAsyncHandler for Device {
         let desired = match new_mode {
             RunMode::Idle => CycleMode::Idle,
             RunMode::Cleaning => CycleMode::Cleaning,
+            RunMode::Mapping => CycleMode::Mapping,
         };
         if !self.cycle_known.get() && desired != CycleMode::Idle {
             return response
@@ -119,6 +137,7 @@ impl rvc_run_mode::ClusterAsyncHandler for Device {
             let result = match new_mode {
                 RunMode::Idle => self.stop().await,
                 RunMode::Cleaning => self.start_cleaning().await,
+                RunMode::Mapping => self.start_mapping().await,
             };
             if let Err(error) = result {
                 log::warn!("Run mode command failed: {error:#}");
@@ -152,6 +171,7 @@ fn build_mode<P: TLVBuilderParent>(
     let (label, tag) = match mode {
         RunMode::Idle => ("Idle", rvc_run_mode::ModeTag::Idle),
         RunMode::Cleaning => ("Cleaning", rvc_run_mode::ModeTag::Cleaning),
+        RunMode::Mapping => ("Mapping", rvc_run_mode::ModeTag::Mapping),
     };
 
     builder
@@ -166,16 +186,27 @@ fn build_mode<P: TLVBuilderParent>(
         .end()
 }
 
-fn supported_modes() -> Vec<RunMode> {
-    vec![RunMode::Idle, RunMode::Cleaning]
+fn supported_modes(mapping: bool) -> Vec<RunMode> {
+    let mut modes = vec![RunMode::Idle, RunMode::Cleaning];
+    if mapping {
+        modes.push(RunMode::Mapping);
+    }
+    modes
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn unimplemented_mapping_is_not_advertised_or_accepted() {
-        assert_eq!(supported_modes(), vec![RunMode::Idle, RunMode::Cleaning]);
-        assert!(RunMode::try_from(2u8).is_err());
+    fn mapping_is_advertised_only_for_capable_devices_with_stable_ids() {
+        assert_eq!(
+            supported_modes(false),
+            vec![RunMode::Idle, RunMode::Cleaning]
+        );
+        assert_eq!(
+            supported_modes(true),
+            vec![RunMode::Idle, RunMode::Cleaning, RunMode::Mapping]
+        );
+        assert_eq!(u8::from(RunMode::Mapping), 2);
     }
 }
