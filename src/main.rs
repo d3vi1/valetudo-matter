@@ -10,6 +10,7 @@ mod device;
 mod generated;
 mod handlers;
 mod http;
+mod identity;
 mod net;
 mod node;
 mod persistence_path;

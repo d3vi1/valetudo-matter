@@ -15,7 +15,7 @@ use rs_matter::{
             desc::{self, ClusterHandler as _},
             net_comm::SharedNetworks,
         },
-        devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET},
+        devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_COMM},
         endpoints,
         events::NoEvents,
         networks::{SysNetifs, eth::EthNetwork},
@@ -44,8 +44,10 @@ pub(crate) async fn run(
     device: &Device,
     persistence_dir: &Path,
 ) -> anyhow::Result<()> {
+    let identity = crate::identity::Identity::load(&device.client).await?;
+    let basic_info = identity.basic_info();
     let mut matter = Matter::new(
-        &TEST_DEV_DET,
+        &basic_info,
         TEST_DEV_COMM,
         &TEST_DEV_ATT,
         rs_matter::utils::epoch::sys_epoch,
