@@ -74,12 +74,7 @@ impl rvc_run_mode::ClusterAsyncHandler for Device {
         _ctx: impl rs_matter::dm::ReadContext,
     ) -> Result<u8, rs_matter::error::Error> {
         self.ensure_known_status().map_err(to_matter_err)?;
-        if !self.cycle_known.get()
-            || (self.cycle_mode.get() == CycleMode::Mapping
-                && !self
-                    .capabilities
-                    .contains(Capability::MappingPassCapability))
-        {
+        if !self.cycle_known.get() {
             return Err(ErrorCode::InvalidAction.into());
         }
         Ok(self.cycle_mode.get() as u8)
@@ -134,10 +129,10 @@ impl rvc_run_mode::ClusterAsyncHandler for Device {
                     .status_text(Some("Stop the active cycle before starting another mode"))?
                     .end();
             }
-            let start_receipt = self.start_receipt();
             if desired != CycleMode::Idle {
                 self.begin_timing(desired, received_at);
             }
+            let start_receipt = self.start_receipt();
             let result = match new_mode {
                 RunMode::Idle => self.stop().await,
                 RunMode::Cleaning => self.start_cleaning().await,
@@ -203,7 +198,7 @@ fn supported_modes(mapping: bool) -> Vec<RunMode> {
 mod tests {
     use super::*;
     #[test]
-    fn mapping_is_advertised_only_for_capable_devices_with_stable_ids() {
+    fn mapping_is_advertised_only_with_capability_and_stable_ids() {
         assert_eq!(
             supported_modes(false),
             vec![RunMode::Idle, RunMode::Cleaning]

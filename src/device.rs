@@ -5,17 +5,17 @@ use std::{
 
 use anyhow::{Context as _, bail};
 use enumset::EnumSet;
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use rand::thread_rng;
 use rs_matter::dm::AttrChangeNotifier;
 use smol::{Timer, stream::StreamExt};
 
 mod capabilities;
 mod cycle_timing;
-use cycle_timing::{CompletionTiming, CycleTiming};
 mod state;
 
 pub(crate) use capabilities::*;
+use cycle_timing::{CompletionTiming, CycleTiming};
 pub(crate) use state::*;
 
 use crate::{handlers::VersionedCell, http::ValetudoClient};
@@ -45,20 +45,18 @@ pub(crate) struct MapSegment {
 pub(crate) struct Device {
     pub(crate) client: ValetudoClient,
     pub(crate) capabilities: EnumSet<Capability>,
-    pub(crate) cleaning_presets: EnumSet<Preset>,
     pub(crate) fan_speed_modes: bool,
+    pub(crate) cleaning_presets: EnumSet<Preset>,
     pub(crate) current_preset: VersionedCell<Option<Preset>>,
     pub(crate) current_state: VersionedCell<DeviceState>,
     pub(crate) identify_time: VersionedCell<u16>,
+    pub(crate) segments: RefCell<Vec<MapSegment>>,
     pub(crate) identify_deadline: Cell<Option<std::time::Instant>>,
     pub(crate) identify_wake: (smol::channel::Sender<()>, smol::channel::Receiver<()>),
-    pub(crate) segments: RefCell<Vec<MapSegment>>,
-    pub(crate) selection_invalidated: Cell<bool>,
     pub(crate) battery: VersionedCell<BatteryState>,
     pub(crate) power_battery: crate::power_source::PowerBattery,
     pub(crate) cycle_mode: VersionedCell<CycleMode>,
     pub(crate) cycle_known: Cell<bool>,
-    cycle_timing: RefCell<CycleTiming>,
     pub(crate) robot_error: RefCell<Option<RobotError>>,
     pending_events: RefCell<std::collections::VecDeque<OperationalEvent>>,
     cycle_observed_active: Cell<bool>,
@@ -68,7 +66,9 @@ pub(crate) struct Device {
     /// Saved history has no operation ID and cannot establish this trust.
     pub(crate) resume_context_trusted: Cell<bool>,
     pub(crate) selected_areas: RefCell<Vec<u32>>,
+    pub(crate) selection_invalidated: Cell<bool>,
     command_in_progress: Cell<bool>,
+    cycle_timing: RefCell<CycleTiming>,
     completion_generation: Cell<u64>,
     observation_epoch: Cell<u64>,
 }
@@ -99,7 +99,7 @@ impl Device {
             None
         };
         let cleaning_presets = match preset_path {
-            Some(path) => match client.get::<Vec<String>>(path).await {
+            Some(path) => match client.get_optional::<Vec<String>>(path).await {
                 Ok(presets) => known_presets(presets)
                     .iter()
                     .filter(|preset| {
@@ -155,18 +155,48 @@ impl Device {
             _ => None,
         });
 
-        let segments: Vec<MapSegment> =
-            if capabilities.contains(Capability::MapSegmentationCapability) {
-                client
-                    .get("/api/v2/robot/capabilities/MapSegmentationCapability")
-                    .await
-                    .unwrap_or_else(|error| {
-                        warn!("Optional map segments unavailable: {error:#}");
-                        Vec::new()
-                    })
-            } else {
+        let segments: Vec<MapSegment> = if capabilities
+            .contains(Capability::MapSegmentationCapability)
+        {
+            debug!("fetching segments");
+            let initial: anyhow::Result<Vec<MapSegment>> = client
+                .get_optional("/api/v2/robot/capabilities/MapSegmentationCapability")
+                .await;
+            let available = initial.is_ok();
+            let mut segs = initial.unwrap_or_else(|e| {
+                warn!("Optional map segments unavailable: {e}");
                 Vec::new()
-            };
+            });
+
+            // The native map upload can lag behind Valetudo's HTTP startup.
+            // Do not freeze an empty Service Area list on a normal reboot.
+            for attempt in 0..45 {
+                if !available || !segs.is_empty() {
+                    break;
+                }
+                if attempt == 0 {
+                    info!("Waiting for Valetudo map segments (up to 90 seconds plus HTTP time)");
+                }
+                Timer::after(time::Duration::from_secs(2)).await;
+                match client
+                    .get_optional("/api/v2/robot/capabilities/MapSegmentationCapability")
+                    .await
+                {
+                    Ok(value) => segs = value,
+                    Err(e) => {
+                        warn!("Optional map segments unavailable: {e}");
+                        break;
+                    }
+                }
+            }
+            if segs.is_empty() {
+                warn!("No map segments available at startup; restart bridge after creating a map");
+            }
+            info!("Service Area segments: {segs:?}");
+            segs
+        } else {
+            Vec::new()
+        };
 
         let default_preset = current_preset_value
             .and_then(preset_from_str)
@@ -176,15 +206,14 @@ impl Device {
         Ok(Self {
             client: client.clone(),
             capabilities,
-            cleaning_presets,
             fan_speed_modes,
+            cleaning_presets,
             current_preset: VersionedCell::new(default_preset, &mut thread_rng()),
             current_state,
             identify_time: VersionedCell::new(0, &mut thread_rng()),
+            segments: RefCell::new(Self::normalize_segments(segments)),
             identify_deadline: Cell::new(None),
             identify_wake: smol::channel::bounded(1),
-            segments: RefCell::new(Self::normalize_segments(segments)),
-            selection_invalidated: Cell::new(false),
             battery: VersionedCell::new(
                 attributes
                     .iter()
@@ -213,7 +242,6 @@ impl Device {
                 matches!(*value, StatusValue::Cleaning | StatusValue::Returning)
                     || (*value == StatusValue::Moving && *flag == StatusFlag::Mapping),
             ),
-            cycle_timing: RefCell::new(CycleTiming::default()),
             cycle_known: Cell::new(cycle_is_unambiguous(DeviceState {
                 value: *value,
                 flag: *flag,
@@ -237,7 +265,9 @@ impl Device {
                     || (*value == StatusValue::Moving && *flag == StatusFlag::Mapping),
             ),
             selected_areas: RefCell::new(Vec::new()),
+            selection_invalidated: Cell::new(false),
             command_in_progress: Cell::new(false),
+            cycle_timing: RefCell::new(CycleTiming::default()),
             completion_generation: Cell::new(0),
             observation_epoch: Cell::new(0),
         })
@@ -318,8 +348,10 @@ impl Device {
                 Ok(Some(event)) => serde_json::from_str(&event?).context("Invalid event")?,
                 Ok(None) => break,
                 Err(()) => {
-                    let snapshot: Vec<StateAttribute> =
-                        self.client.get("/api/v2/robot/state/attributes").await?;
+                    let snapshot: Vec<StateAttribute> = self
+                        .client
+                        .get_optional("/api/v2/robot/state/attributes")
+                        .await?;
                     refresh_at = std::time::Instant::now() + time::Duration::from_secs(15);
                     self.apply_snapshot(
                         &snapshot,
@@ -420,7 +452,6 @@ impl Device {
                         .update(next, std::time::Instant::now(), notify);
                     if next != self.battery.get() {
                         self.battery.set(next);
-
                         self.current_state.dataver_changed();
                         notify.notify_cluster_changed(1, operational_state_cluster);
                     }
@@ -604,6 +635,22 @@ impl Device {
         }
     }
 
+    /// An HTTP acknowledgement must not overwrite newer observed state (or a
+    /// telemetry gap) received while the request was in flight.
+    pub(crate) fn acknowledge_state(
+        &self,
+        receipt: u32,
+        state: DeviceState,
+        ctx: &impl rs_matter::dm::OperationContext,
+    ) -> bool {
+        if self.current_state.dataver() != receipt {
+            return false;
+        }
+        self.current_state.set_notify(state, ctx);
+        self.observe_command_timing();
+        true
+    }
+
     pub(crate) fn begin_timing(&self, mode: CycleMode, received_at: std::time::Instant) {
         self.cycle_timing.borrow_mut().begin(mode, received_at);
     }
@@ -697,11 +744,10 @@ impl Device {
     }
 
     pub(crate) async fn start_cleaning(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.selection_invalidated.get(),
-            "Selected rooms changed; explicitly select rooms again before starting"
-        );
         self.ensure_known_status()?;
+        if self.selection_invalidated.get() {
+            bail!("Selected rooms changed; select areas again before starting");
+        }
         let selected = self.selected_areas.borrow().clone();
         if selected.is_empty() {
             debug!("starting full clean");
@@ -724,10 +770,9 @@ impl Device {
                 .collect();
 
             debug!("starting segment clean for segments: {segment_ids:?}");
-            anyhow::ensure!(
-                segment_ids.len() == selected.len(),
-                "Selected room is unavailable"
-            );
+            if segment_ids.len() != selected.len() {
+                bail!("Selected area no longer exists");
+            }
             let body = serde_json::json!({"action": "start_segment_action", "segment_ids": segment_ids, "iterations": 1}).to_string();
             self.client
                 .put("/api/v2/robot/capabilities/MapSegmentationCapability", body)
@@ -796,7 +841,7 @@ impl Device {
     }
 }
 
-/// Preserve numeric IDs; deterministically map nonnumeric IDs across restarts.
+/// Map a Valetudo segment to a Matter area ID by parsing the string ID.
 pub(crate) fn segment_area_id(segment: &MapSegment) -> Option<u32> {
     if segment.id.is_empty() {
         return None;
@@ -826,6 +871,171 @@ fn preset_from_str(s: &str) -> Option<Preset> {
         "max" => Some(Preset::Max),
         "off" => Some(Preset::Off),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod s5_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    // Exercise the real HTTP client against the S5 capability shape, including
+    // routing a mode change to fan speed rather than operation mode.
+    #[test]
+    fn s5_fan_modes_initialize_and_use_fan_api() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let replies = [
+                (
+                    "GET",
+                    "/api/v2/robot/capabilities",
+                    r#"["BasicControlCapability","FanSpeedControlCapability","MapSegmentationCapability","FutureCapability"]"#,
+                ),
+                (
+                    "GET",
+                    "/api/v2/robot/capabilities/FanSpeedControlCapability/presets",
+                    r#"["low","medium","high","max","off","future_preset"]"#,
+                ),
+                (
+                    "GET",
+                    "/api/v2/robot/state/attributes",
+                    r#"[{"__class":"StatusStateAttribute","value":"docked","flag":"none"},{"__class":"PresetSelectionStateAttribute","type":"fan_speed","value":"medium"}]"#,
+                ),
+                (
+                    "GET",
+                    "/api/v2/robot/capabilities/MapSegmentationCapability",
+                    "[]",
+                ),
+                (
+                    "GET",
+                    "/api/v2/robot/capabilities/MapSegmentationCapability",
+                    r#"[{"id":"16","name":"Upper Bathroom"},{"id":"17","name":"Upper Bedroom"}]"#,
+                ),
+                (
+                    "PUT",
+                    "/api/v2/robot/capabilities/FanSpeedControlCapability/preset",
+                    "{}",
+                ),
+                (
+                    "PUT",
+                    "/api/v2/robot/capabilities/BasicControlCapability",
+                    "{}",
+                ),
+            ];
+            for (method, path, reply) in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                let header = String::from_utf8(request).unwrap();
+                let first = header.lines().next().unwrap();
+                assert!(first.starts_with(method), "{first}");
+                assert!(first.contains(path), "{first}");
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).unwrap();
+                if method == "PUT" {
+                    let expected = if path.ends_with("/preset") {
+                        serde_json::json!({"name":"high"})
+                    } else {
+                        serde_json::json!({"action":"start"})
+                    };
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                        expected
+                    );
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    reply.len(),
+                    reply
+                )
+                .unwrap();
+            }
+        });
+        let ex = Box::leak(Box::new(smol::LocalExecutor::new()));
+        smol::block_on(ex.run(async {
+            let client = ValetudoClient::new(ex, format!("http://{address}").parse().unwrap());
+            let device = Device::init(client).await.unwrap();
+            assert_eq!(device.segments.borrow().len(), 2);
+            assert_eq!(segment_area_id(&device.segments.borrow()[0]), Some(16));
+            assert_eq!(
+                device.segments.borrow()[0].name.as_deref(),
+                Some("Upper Bathroom")
+            );
+            assert!(device.fan_speed_modes);
+            assert_eq!(device.cleaning_presets.len(), 5);
+            assert_eq!(device.current_preset.get(), Some(Preset::Medium));
+            assert!(!device.capabilities.contains(Capability::Unknown));
+            device.set_preset(Preset::High).await.unwrap();
+            device.selected_areas.borrow_mut().push(16);
+            // Resume must invoke BasicControl.start even when rooms remain selected.
+            // Valetudo chooses resume_segment_clean instead of restarting the rooms.
+            device.resume().await.unwrap();
+            struct Notify;
+            impl AttrChangeNotifier for Notify {
+                fn notify_attr_changed(&self, _: u16, _: u32, _: u32) {}
+                fn notify_cluster_changed(&self, _: u16, _: u32) {}
+                fn notify_endpoint_changed(&self, _: u16) {}
+                fn notify_all_changed(&self) {}
+            }
+            device.apply_attributes(
+                &[
+                    StateAttribute::StatusStateAttribute {
+                        value: StatusValue::Unknown,
+                        flag: StatusFlag::Unknown,
+                        error: None,
+                    },
+                    StateAttribute::PresetSelectionStateAttribute {
+                        r#type: "fan_speed".into(),
+                        value: "future_preset".into(),
+                    },
+                    StateAttribute::Unknown,
+                ],
+                &Notify,
+                0x54,
+                0x55,
+                0x61,
+            );
+            assert!(device.ensure_known_status().is_err());
+            assert!(device.start_cleaning().await.is_err()); // Must not send any HTTP command.
+            assert_eq!(device.current_preset.get(), None);
+            device.apply_attributes(
+                &[
+                    StateAttribute::StatusStateAttribute {
+                        value: StatusValue::Docked,
+                        flag: StatusFlag::None,
+                        error: None,
+                    },
+                    StateAttribute::PresetSelectionStateAttribute {
+                        r#type: "fan_speed".into(),
+                        value: "low".into(),
+                    },
+                ],
+                &Notify,
+                0x54,
+                0x55,
+                0x61,
+            );
+            assert!(device.ensure_known_status().is_ok());
+            assert_eq!(device.current_preset.get(), Some(Preset::Low));
+        }));
+        server.join().unwrap();
     }
 }
 
@@ -952,30 +1162,28 @@ impl OperationalEvent {
 }
 
 #[cfg(test)]
-pub(crate) mod cycle_tests {
+mod cycle_tests {
     use super::*;
 
-    pub(crate) fn device() -> Device {
+    pub(super) fn device() -> Device {
         let executor = Box::leak(Box::new(smol::LocalExecutor::new()));
         Device {
             client: ValetudoClient::new(executor, "http://127.0.0.1:1".parse().unwrap()),
             capabilities: EnumSet::new(),
-            cleaning_presets: EnumSet::new(),
             fan_speed_modes: false,
+            cleaning_presets: EnumSet::new(),
             current_preset: VersionedCell::new(None, &mut thread_rng()),
             current_state: VersionedCell::new(DeviceState::default(), &mut thread_rng()),
             identify_time: VersionedCell::new(0, &mut thread_rng()),
+            segments: RefCell::new(Vec::new()),
             identify_deadline: Cell::new(None),
             identify_wake: smol::channel::bounded(1),
-            segments: RefCell::new(Vec::new()),
-            selection_invalidated: Cell::new(false),
             battery: VersionedCell::new(BatteryState::default(), &mut thread_rng()),
             power_battery: crate::power_source::PowerBattery::new(
                 BatteryState::default(),
                 std::time::Instant::now(),
             ),
             cycle_known: Cell::new(true),
-            cycle_timing: RefCell::new(CycleTiming::default()),
             resume_context_trusted: Cell::new(false),
             cycle_mode: VersionedCell::new(CycleMode::Idle, &mut thread_rng()),
             robot_error: RefCell::new(None),
@@ -984,7 +1192,9 @@ pub(crate) mod cycle_tests {
             start_pending_since: Cell::new(None),
             paused_activity: Cell::new(None),
             selected_areas: RefCell::new(Vec::new()),
+            selection_invalidated: Cell::new(false),
             command_in_progress: Cell::new(false),
+            cycle_timing: RefCell::new(CycleTiming::default()),
             completion_generation: Cell::new(0),
             observation_epoch: Cell::new(0),
         }
@@ -1144,31 +1354,8 @@ pub(crate) mod cycle_tests {
         assert!(!device.supports_clean_modes());
         device.cleaning_presets.insert(Preset::Mop);
         assert!(device.supports_clean_modes());
-        device.cleaning_presets = [Preset::VacuumThenMop].into_iter().collect();
+        device.cleaning_presets = [Preset::Off, Preset::VacuumThenMop].into_iter().collect();
         assert!(!device.supports_clean_modes());
-    }
-
-    #[test]
-    fn event_payload_is_valid_matter_tlv_with_bounded_utf8_error() {
-        use rs_matter::{tlv::TLVElement, utils::storage::WriteBuf};
-        let mut buffer = [0; 512];
-        let mut writer = WriteBuf::new(&mut buffer);
-        OperationalEvent::Error(Some(RobotError {
-            message: "ș".repeat(40),
-            vendor_error_code: "1".into(),
-        }))
-        .write(&mut writer)
-        .unwrap();
-        let data = TLVElement::new(writer.as_slice()).structure().unwrap();
-        let error = data.find_ctx(0).unwrap().structure().unwrap();
-        assert_eq!(error.find_ctx(0).unwrap().u8().unwrap(), 2);
-        assert_eq!(error.find_ctx(1).unwrap().utf8().unwrap(), "1");
-        assert_eq!(error.find_ctx(2).unwrap().utf8().unwrap(), "ș".repeat(32));
-        let mut writer = WriteBuf::new(&mut buffer);
-        OperationalEvent::Completed(0).write(&mut writer).unwrap();
-        let data = TLVElement::new(writer.as_slice()).structure().unwrap();
-        assert_eq!(data.find_ctx(0).unwrap().u8().unwrap(), 0);
-        assert!(data.find_ctx(1).unwrap().is_empty()); // No fabricated timing statistics.
     }
     #[test]
     fn completion_timing_fields_encode_seconds_and_overflow_null_without_changing_error() {
@@ -1297,6 +1484,29 @@ pub(crate) mod cycle_tests {
         let fields = TLVElement::new(writer.as_slice()).structure().unwrap();
         assert_eq!(fields.find_ctx(1).unwrap().u32().unwrap(), 45);
         assert_eq!(fields.find_ctx(2).unwrap().u32().unwrap(), 20);
+    }
+
+    #[test]
+    fn event_payload_is_valid_matter_tlv_with_bounded_utf8_error() {
+        use rs_matter::{tlv::TLVElement, utils::storage::WriteBuf};
+        let mut buffer = [0; 512];
+        let mut writer = WriteBuf::new(&mut buffer);
+        OperationalEvent::Error(Some(RobotError {
+            message: "ș".repeat(40),
+            vendor_error_code: "1".into(),
+        }))
+        .write(&mut writer)
+        .unwrap();
+        let data = TLVElement::new(writer.as_slice()).structure().unwrap();
+        let error = data.find_ctx(0).unwrap().structure().unwrap();
+        assert_eq!(error.find_ctx(0).unwrap().u8().unwrap(), 2);
+        assert_eq!(error.find_ctx(1).unwrap().utf8().unwrap(), "1");
+        assert_eq!(error.find_ctx(2).unwrap().utf8().unwrap(), "ș".repeat(32));
+        let mut writer = WriteBuf::new(&mut buffer);
+        OperationalEvent::Completed(0).write(&mut writer).unwrap();
+        let data = TLVElement::new(writer.as_slice()).structure().unwrap();
+        assert_eq!(data.find_ctx(0).unwrap().u8().unwrap(), 0);
+        assert!(data.find_ctx(1).unwrap().is_empty()); // No fabricated timing statistics.
     }
 }
 

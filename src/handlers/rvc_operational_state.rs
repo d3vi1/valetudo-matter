@@ -159,6 +159,7 @@ impl rvc_operational_state::ClusterAsyncHandler for Device {
             return build_response(response, 3);
         };
 
+        let receipt = self.current_state.dataver();
         let state = self.current_state.get();
         let action = if self.cycle_mode.get() == device::CycleMode::Mapping
             && state.value != device::StatusValue::Returning
@@ -174,16 +175,17 @@ impl rvc_operational_state::ClusterAsyncHandler for Device {
             CommandAction::Reject => 3,
             CommandAction::Invoke => match self.pause().await {
                 Ok(()) => {
-                    self.paused_activity.set(Some(state));
-                    self.resume_context_trusted.set(true);
-                    self.current_state.set_notify(
+                    if self.acknowledge_state(
+                        receipt,
                         device::DeviceState {
                             value: device::StatusValue::Paused,
                             flag: device::StatusFlag::Resumable,
                         },
                         &ctx,
-                    );
-                    self.observe_command_timing();
+                    ) {
+                        self.paused_activity.set(Some(state));
+                        self.resume_context_trusted.set(true);
+                    }
                     0
                 }
                 Err(error) => {
@@ -205,6 +207,12 @@ impl rvc_operational_state::ClusterAsyncHandler for Device {
             return build_response(response, 1);
         };
 
+        let receipt = self.current_state.dataver();
+        let returning = self
+            .paused_activity
+            .get()
+            .is_some_and(|state| state.value == device::StatusValue::Returning);
+        let mapping = self.cycle_mode.get() == device::CycleMode::Mapping;
         let state = self.current_state.get();
         let can_resume = self.resume_context_trusted.get()
             && ((self.cycle_known.get()
@@ -225,12 +233,8 @@ impl rvc_operational_state::ClusterAsyncHandler for Device {
             }
             CommandAction::Invoke => match self.resume().await {
                 Ok(()) => {
-                    let mapping = self.cycle_mode.get() == device::CycleMode::Mapping;
-                    let returning = self
-                        .paused_activity
-                        .get()
-                        .is_some_and(|state| state.value == device::StatusValue::Returning);
-                    self.current_state.set_notify(
+                    self.acknowledge_state(
+                        receipt,
                         device::DeviceState {
                             value: if returning {
                                 device::StatusValue::Returning
@@ -247,7 +251,6 @@ impl rvc_operational_state::ClusterAsyncHandler for Device {
                         },
                         &ctx,
                     );
-                    self.observe_command_timing();
                     0
                 }
                 Err(error) => {
@@ -269,19 +272,20 @@ impl rvc_operational_state::ClusterAsyncHandler for Device {
             return build_response(response, 3);
         };
 
+        let receipt = self.current_state.dataver();
         let code = match home_action(self.current_state.get()) {
             CommandAction::Noop => 0,
             CommandAction::Reject => 3,
             CommandAction::Invoke => match self.go_home().await {
                 Ok(()) => {
-                    self.current_state.set_notify(
+                    self.acknowledge_state(
+                        receipt,
                         device::DeviceState {
                             value: device::StatusValue::Returning,
                             flag: device::StatusFlag::None,
                         },
                         &ctx,
                     );
-                    self.observe_command_timing();
                     0
                 }
                 Err(error) => {

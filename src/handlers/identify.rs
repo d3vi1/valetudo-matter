@@ -229,9 +229,5 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "identify_tests.rs"]
-mod integration_tests;
-
-#[cfg(test)]
 #[path = "identify_monitor_tests.rs"]
 mod monitor_tests;

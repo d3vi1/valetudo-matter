@@ -94,6 +94,13 @@ impl ValetudoClient {
         Ok(res)
     }
 
+    pub(crate) async fn get_optional<T>(&self, path: &str) -> anyhow::Result<T>
+    where
+        for<'t> T: serde::Deserialize<'t>,
+    {
+        self.get(path).await
+    }
+
     pub(crate) async fn put(&self, path_and_query: &str, body: String) -> anyhow::Result<()> {
         // One deadline covers DNS, connect, headers and the complete response.
         // Never retry a mutating request: a timeout may mean it was executed.

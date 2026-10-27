@@ -7,14 +7,18 @@ use smol::LocalExecutor;
 use crate::{device::Device, http::ValetudoClient};
 
 mod device;
+mod general_diagnostics;
 mod generated;
 mod handlers;
 mod http;
 mod identity;
+mod matter_audit;
 mod net;
 mod node;
+mod node_lifetime;
 mod persistence_path;
 mod power_source;
+mod wifi_diagnostics;
 
 const DEFAULT_VALETUDO_URI: &str = "http://localhost:80";
 
@@ -34,6 +38,15 @@ async fn run(ex: &'static LocalExecutor<'static>) -> anyhow::Result<()> {
         hyper::Uri::from_str(&valetudo_uri).context("Failed to parse VALETUDO_URI")?;
     if valetudo_uri.authority().is_none() {
         bail!("Invalid VALETUDO_MATTER_BASE_URI: {valetudo_uri}");
+    }
+
+    // Read-only support report: no Matter node, persistence or commissioning.
+    if std::env::args().nth(1).as_deref() == Some("--diagnostics") {
+        let client = ValetudoClient::new(ex, valetudo_uri);
+        let native = std::env::var("VALETUDO_MATTER_NATIVE_DIAGNOSTICS").as_deref() == Ok("1");
+        let identity = identity::Identity::load(&client, native).await?;
+        println!("{}", serde_json::to_string_pretty(identity.diagnostics())?);
+        return Ok(());
     }
 
     let persistence_dir = persistence_path::resolve()?;

@@ -1,6 +1,98 @@
 //! Drive the real background worker: short requests must wake it immediately.
-use super::integration_tests::Context;
 use super::*;
+use rs_matter::{dm, im::EventPriority, tlv::TLVElement};
+use std::cell::Cell;
+#[derive(Default)]
+struct Context {
+    notifications: Cell<usize>,
+}
+impl dm::AttrChangeNotifier for Context {
+    fn notify_attr_changed(&self, _: u16, _: u32, _: u32) {
+        self.notifications.set(self.notifications.get() + 1);
+    }
+    fn notify_cluster_changed(&self, _: u16, _: u32) {
+        self.notifications.set(self.notifications.get() + 1);
+    }
+    fn notify_endpoint_changed(&self, _: u16) {
+        self.notifications.set(self.notifications.get() + 1);
+    }
+    fn notify_all_changed(&self) {
+        self.notifications.set(self.notifications.get() + 1);
+    }
+}
+impl dm::OwnAttrChangeNotifier for Context {
+    fn notify_own_attr_changed(&self, _: u32) {
+        self.notifications.set(self.notifications.get() + 1);
+    }
+    fn notify_own_cluster_changed(&self) {
+        self.notifications.set(self.notifications.get() + 1);
+    }
+    fn notify_own_endpoint_changed(&self) {
+        self.notifications.set(self.notifications.get() + 1);
+    }
+}
+impl dm::EventEmitter for Context {
+    fn emit_event<F>(&self, _: u16, _: u32, _: u32, _: EventPriority, _: F) -> Result<u64, Error>
+    where
+        F: FnOnce(dm::events::EventTLVWrite<'_>) -> Result<(), Error>,
+    {
+        panic!("unexpected direct event");
+    }
+}
+impl dm::OwnEventEmitter for Context {
+    fn emit_own_event<F>(&self, _: u32, _: EventPriority, _: F) -> Result<u64, Error>
+    where
+        F: FnOnce(dm::events::EventTLVWrite<'_>) -> Result<(), Error>,
+    {
+        panic!("unexpected direct event");
+    }
+}
+impl dm::HandlerContext for Context {
+    fn matter(&self) -> &rs_matter::Matter<'_> {
+        panic!("unexpected Matter access");
+    }
+    fn crypto(&self) -> impl rs_matter::crypto::Crypto + '_ {
+        rs_matter::crypto::default_crypto(rand::thread_rng(), dm::devices::test::DAC_PRIVKEY)
+    }
+    fn kv(&self) -> impl rs_matter::persist::KvBlobStoreAccess + '_ {
+        rs_matter::persist::DummyKvBlobStoreAccess
+    }
+    fn networks(&self) -> impl dm::clusters::net_comm::NetworksAccess + '_ {
+        dm::clusters::net_comm::DummyNetworkAccess
+    }
+    fn handler(&self) -> impl dm::AsyncHandler + '_ {
+        dm::EmptyHandler
+    }
+    fn buffers(&self) -> impl rs_matter::utils::storage::pooled::BufferAccess<dm::IMBuffer> + '_ {
+        rs_matter::utils::storage::pooled::PooledBuffers::<1, dm::IMBuffer>::new(0)
+    }
+}
+impl dm::OperationContext for Context {
+    fn exchange(&self) -> &rs_matter::transport::exchange::Exchange<'_> {
+        panic!("unexpected exchange");
+    }
+    fn endpt(&self) -> u16 {
+        1
+    }
+    fn cluster(&self) -> u32 {
+        3
+    }
+}
+impl dm::InvokeContext for Context {
+    fn cmd(&self) -> &dm::CmdDetails<'_> {
+        panic!("unexpected command details");
+    }
+    fn data(&self) -> &TLVElement<'_> {
+        panic!("unexpected raw data");
+    }
+}
+
+impl dm::ReadContext for Context {
+    fn attr(&self) -> &dm::AttrDetails<'_> {
+        panic!("unexpected attribute details");
+    }
+}
+
 #[test]
 fn idle_worker_wakes_for_short_request_and_immediate_cancel_restart() {
     use std::io::{Read, Write};

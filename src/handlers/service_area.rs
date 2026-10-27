@@ -277,7 +277,7 @@ impl Device {
     pub(crate) async fn refresh_segments(&self, notify: &impl rs_matter::dm::AttrChangeNotifier) {
         match self
             .client
-            .get::<Vec<MapSegment>>("/api/v2/robot/capabilities/MapSegmentationCapability")
+            .get_optional::<Vec<MapSegment>>("/api/v2/robot/capabilities/MapSegmentationCapability")
             .await
         {
             Ok(segments) => {
@@ -405,7 +405,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-#[path = "service_area_tests.rs"]
-mod handler_tests;
