@@ -10,8 +10,8 @@ use crate::http::ValetudoClient;
 
 // Ordered Matter implementation release, independent of vendor firmware strings.
 // Never derive this from firmware or reset it when presentation changes.
-const BRIDGE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-s5.10");
-const BRIDGE_VERSION_NUMBER: u32 = 10_010;
+const IMPLEMENTATION_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MATTER_SOFTWARE_VERSION: u32 = 10_010;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,14 +118,14 @@ impl Identity {
             native,
             robot_firmware: optional_version(properties.firmware_version.as_deref(), 64),
             valetudo: optional_version(valetudo.release.as_deref(), 64),
-            valetudo_matter: BRIDGE_VERSION,
-            matter_software_version: BRIDGE_VERSION_NUMBER,
+            valetudo_matter: IMPLEMENTATION_VERSION,
+            matter_software_version: MATTER_SOFTWARE_VERSION,
         };
         let software = if native {
             diagnostics.robot_firmware.clone()
         } else {
             software_display(
-                BRIDGE_VERSION,
+                IMPLEMENTATION_VERSION,
                 valetudo.release.as_deref(),
                 properties.firmware_version.as_deref(),
             )?
@@ -148,7 +148,7 @@ impl Identity {
             vendor_name: &self.manufacturer,
             product_name: &self.model,
             serial_no: &self.serial,
-            sw_ver: BRIDGE_VERSION_NUMBER,
+            sw_ver: MATTER_SOFTWARE_VERSION,
             sw_ver_str: &self.software,
             device_name: &self.model,
             device_type: Some(0x0074),
@@ -231,10 +231,7 @@ mod tests {
             (info.vendor_name, info.product_name, info.serial_no),
             ("Roborock", "S5", "label-example")
         );
-        assert_eq!(
-            info.sw_ver_str,
-            "VM 0.1.0-s5.10; Valetudo 2026.10.0; FW 002034"
-        );
+        assert_eq!(info.sw_ver_str, "VM 0.1.0; Valetudo 2026.10.0; FW 002034");
         assert_eq!(info.sw_ver, 10_010);
         assert_eq!((info.vid, info.pid), (TEST_VID, TEST_PID));
         assert_eq!((info.hw_ver, info.hw_ver_str), (0, ""));
@@ -330,7 +327,10 @@ mod display_tests {
                     ("Vendor", "Model", "stable-serial")
                 );
                 assert!(info.sw_ver_str.len() <= 64);
-                assert!(info.sw_ver_str.starts_with(&format!("VM {BRIDGE_VERSION}")));
+                assert!(
+                    info.sw_ver_str
+                        .starts_with(&format!("VM {IMPLEMENTATION_VERSION}"))
+                );
                 if info.sw_ver_str.contains("; Valetudo ") {
                     assert!(info.sw_ver_str.contains(&format!("; Valetudo {release}")));
                 }
@@ -464,7 +464,7 @@ mod native_tests {
         let diagnostics = serde_json::to_value(id.diagnostics()).unwrap();
         assert_eq!(diagnostics["robot_firmware"], "002034");
         assert_eq!(diagnostics["valetudo"], "2026.10.0");
-        assert_eq!(diagnostics["valetudo_matter"], BRIDGE_VERSION);
+        assert_eq!(diagnostics["valetudo_matter"], IMPLEMENTATION_VERSION);
     }
     #[test]
     fn native_fallback_preserves_identity_and_numeric_release_order() {
