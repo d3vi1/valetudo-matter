@@ -138,7 +138,7 @@ pub(crate) async fn run(
     }
 
     let mut monitor = pin!(async {
-        future::zip(
+        future::zip(device.monitor_identify(&subscriptions), future::zip(
             device.monitor_segments(&subscriptions),
             future::zip(
                 device.monitor_status(
@@ -155,7 +155,7 @@ pub(crate) async fn run(
                     }
                 },
             ),
-        )
+        ))
         .await;
         Ok::<(), rs_matter::error::Error>(())
     });

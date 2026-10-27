@@ -77,14 +77,7 @@ impl<T: Copy + PartialEq> VersionedCell<T> {
 
         old_value
     }
-    // Kept for the existing Identify handler; replace already updates dataver.
-    pub(crate) fn replace_notify(&self, value: T, ctx: &impl OperationContext) -> T {
-        let old_value = self.replace(value);
-        if old_value != value {
-            ctx.notify_own_cluster_changed();
-        }
-        old_value
-    }
+
 }
 
 fn to_matter_err(err: anyhow::Error) -> Error {
