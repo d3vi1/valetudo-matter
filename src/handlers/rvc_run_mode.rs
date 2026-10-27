@@ -91,6 +91,7 @@ impl rvc_run_mode::ClusterAsyncHandler for Device {
         request: rvc_run_mode::ChangeToModeRequest<'_>,
         response: rvc_run_mode::ChangeToModeResponseBuilder<P>,
     ) -> Result<P, rs_matter::error::Error> {
+        let received_at = std::time::Instant::now();
         let Some(_command) = self.try_command() else {
             return response
                 .status(2)?
@@ -134,12 +135,16 @@ impl rvc_run_mode::ClusterAsyncHandler for Device {
                     .end();
             }
             let start_receipt = self.start_receipt();
+            if desired != CycleMode::Idle {
+                self.begin_timing(desired, received_at);
+            }
             let result = match new_mode {
                 RunMode::Idle => self.stop().await,
                 RunMode::Cleaning => self.start_cleaning().await,
                 RunMode::Mapping => self.start_mapping().await,
             };
             if let Err(error) = result {
+                self.invalidate_timing();
                 log::warn!("Run mode command failed: {error:#}");
                 return response
                     .status(2)?

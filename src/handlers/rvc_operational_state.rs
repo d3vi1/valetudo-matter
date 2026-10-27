@@ -183,9 +183,11 @@ impl rvc_operational_state::ClusterAsyncHandler for Device {
                         },
                         &ctx,
                     );
+                    self.observe_command_timing();
                     0
                 }
                 Err(error) => {
+                    self.invalidate_timing();
                     log::warn!("Pause failed: {error:#}");
                     3
                 }
@@ -245,9 +247,11 @@ impl rvc_operational_state::ClusterAsyncHandler for Device {
                         },
                         &ctx,
                     );
+                    self.observe_command_timing();
                     0
                 }
                 Err(error) => {
+                    self.invalidate_timing();
                     log::warn!("Resume failed: {error:#}");
                     1
                 }
@@ -277,9 +281,11 @@ impl rvc_operational_state::ClusterAsyncHandler for Device {
                         },
                         &ctx,
                     );
+                    self.observe_command_timing();
                     0
                 }
                 Err(error) => {
+                    self.invalidate_timing();
                     log::warn!("GoHome failed: {error:#}");
                     3
                 }

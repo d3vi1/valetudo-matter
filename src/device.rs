@@ -11,6 +11,8 @@ use rs_matter::dm::AttrChangeNotifier;
 use smol::{Timer, stream::StreamExt};
 
 mod capabilities;
+mod cycle_timing;
+use cycle_timing::{CompletionTiming, CycleTiming};
 mod state;
 
 pub(crate) use capabilities::*;
@@ -53,6 +55,7 @@ pub(crate) struct Device {
     pub(crate) battery: VersionedCell<BatteryState>,
     pub(crate) cycle_mode: VersionedCell<CycleMode>,
     pub(crate) cycle_known: Cell<bool>,
+    cycle_timing: RefCell<CycleTiming>,
     pub(crate) robot_error: RefCell<Option<RobotError>>,
     pending_events: RefCell<std::collections::VecDeque<OperationalEvent>>,
     cycle_observed_active: Cell<bool>,
@@ -193,6 +196,7 @@ impl Device {
                 matches!(*value, StatusValue::Cleaning | StatusValue::Returning)
                     || (*value == StatusValue::Moving && *flag == StatusFlag::Mapping),
             ),
+            cycle_timing: RefCell::new(CycleTiming::default()),
             cycle_known: Cell::new(cycle_is_unambiguous(DeviceState {
                 value: *value,
                 flag: *flag,
@@ -332,6 +336,13 @@ impl Device {
         clean_mode_cluster: u32,
         operational_state_cluster: u32,
     ) {
+        if attrs.iter().any(|attr| {
+            matches!(attr, StateAttribute::StatusStateAttribute { value, flag, .. }
+            if self.current_state.get() != (DeviceState { value: *value, flag: *flag }))
+        }) {
+            // A polling-discovered transition has no trustworthy timestamp.
+            self.invalidate_timing();
+        }
         let mut missing = Vec::new();
         if !attrs
             .iter()
@@ -399,6 +410,9 @@ impl Device {
                         value: *value,
                         flag: *flag,
                     };
+                    self.cycle_timing
+                        .borrow_mut()
+                        .observe(new_state, std::time::Instant::now());
                     debug!("setting state: {:?}/{:?}", value, flag);
                     let old = self.current_state.get();
                     if *value == StatusValue::Unknown {
@@ -558,19 +572,43 @@ impl Device {
         ctx: &impl rs_matter::dm::OperationContext,
     ) -> bool {
         if self.completion_generation.get() != receipt.0 {
+            self.invalidate_timing();
             true // The operation was already observed completing.
         } else if self.observation_epoch.get() != receipt.1 {
+            self.invalidate_timing();
             false // An observation gap makes the physical outcome uncertain.
         } else {
+            self.acknowledge_timing();
             self.set_cycle_mode(mode, ctx);
             true
         }
     }
 
+    pub(crate) fn begin_timing(&self, mode: CycleMode, received_at: std::time::Instant) {
+        self.cycle_timing.borrow_mut().begin(mode, received_at);
+    }
+    pub(crate) fn acknowledge_timing(&self) {
+        self.cycle_timing.borrow_mut().acknowledge();
+    }
+    pub(crate) fn invalidate_timing(&self) {
+        self.cycle_timing.borrow_mut().invalidate();
+    }
+    pub(crate) fn observe_command_timing(&self) {
+        self.cycle_timing
+            .borrow_mut()
+            .observe(self.current_state.get(), std::time::Instant::now());
+    }
     fn queue_completion(&self, code: u8) {
         self.completion_generation
             .set(self.completion_generation.get().wrapping_add(1));
-        self.queue_event(OperationalEvent::Completed(code));
+        let timing = self
+            .cycle_timing
+            .borrow_mut()
+            .finish(std::time::Instant::now());
+        self.queue_event(match timing {
+            Some(timing) => OperationalEvent::CompletedWithTiming(code, timing),
+            None => OperationalEvent::Completed(code),
+        });
     }
 
     /// Serialize command validation, physical dispatch and acknowledged state
@@ -808,6 +846,7 @@ mod compatibility_tests {
 enum OperationalEvent {
     Error(Option<RobotError>),
     Completed(u8),
+    CompletedWithTiming(u8, CompletionTiming),
 }
 
 impl Device {
@@ -831,7 +870,9 @@ impl Device {
             };
             let (id, priority) = match event {
                 OperationalEvent::Error(_) => (0, EventPriority::Critical),
-                OperationalEvent::Completed(_) => (1, EventPriority::Info),
+                OperationalEvent::Completed(_) | OperationalEvent::CompletedWithTiming(_, _) => {
+                    (1, EventPriority::Info)
+                }
             };
             let result =
                 emitter.emit_event(1, 0x61, id, priority, |mut writer| event.write(&mut writer));
@@ -874,7 +915,17 @@ impl OperationalEvent {
                 }
                 writer.end_container()?;
             }
-            Self::Completed(code) => writer.u8(&TLVTag::Context(0), *code)?,
+            Self::Completed(code) | Self::CompletedWithTiming(code, _) => {
+                writer.u8(&TLVTag::Context(0), *code)?;
+                if let Self::CompletedWithTiming(_, timing) = self {
+                    for (tag, value) in [(1, timing.total_seconds), (2, timing.paused_seconds)] {
+                        match value {
+                            Some(seconds) => writer.u32(&TLVTag::Context(tag), seconds)?,
+                            None => writer.null(&TLVTag::Context(tag))?,
+                        }
+                    }
+                }
+            }
         }
         writer.end_container()
     }
@@ -898,6 +949,7 @@ pub(crate) mod cycle_tests {
             selection_invalidated: Cell::new(false),
             battery: VersionedCell::new(BatteryState::default(), &mut thread_rng()),
             cycle_known: Cell::new(true),
+            cycle_timing: RefCell::new(CycleTiming::default()),
             resume_context_trusted: Cell::new(false),
             cycle_mode: VersionedCell::new(CycleMode::Idle, &mut thread_rng()),
             robot_error: RefCell::new(None),
@@ -1091,6 +1143,134 @@ pub(crate) mod cycle_tests {
         let data = TLVElement::new(writer.as_slice()).structure().unwrap();
         assert_eq!(data.find_ctx(0).unwrap().u8().unwrap(), 0);
         assert!(data.find_ctx(1).unwrap().is_empty()); // No fabricated timing statistics.
+    }
+    #[test]
+    fn completion_timing_fields_encode_seconds_and_overflow_null_without_changing_error() {
+        use rs_matter::{tlv::TLVElement, utils::storage::WriteBuf};
+        for timing in [
+            CompletionTiming {
+                total_seconds: Some(45),
+                paused_seconds: Some(20),
+            },
+            CompletionTiming {
+                total_seconds: None,
+                paused_seconds: None,
+            },
+        ] {
+            let event = OperationalEvent::CompletedWithTiming(2, timing);
+            let mut buffer = [0; 128];
+            let mut writer = WriteBuf::new(&mut buffer);
+            event.write(&mut writer).unwrap();
+            let fields = TLVElement::new(writer.as_slice()).structure().unwrap();
+            assert_eq!(fields.find_ctx(0).unwrap().u8().unwrap(), 2);
+            for (tag, expected) in [(1, timing.total_seconds), (2, timing.paused_seconds)] {
+                match expected {
+                    Some(seconds) => {
+                        assert_eq!(fields.find_ctx(tag).unwrap().u32().unwrap(), seconds)
+                    }
+                    None => assert!(fields.find_ctx(tag).unwrap().null().is_ok()),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unchanged_poll_and_partial_sse_preserve_timing_but_discovered_transition_invalidates() {
+        let device = device();
+        let now = std::time::Instant::now();
+        device.begin_timing(CycleMode::Cleaning, now);
+        device.acknowledge_timing();
+        status(&device, StatusValue::Cleaning, StatusFlag::Segment);
+        device.apply_attributes(&[StateAttribute::Unknown], &(), 0x54, 0x55, 0x61);
+        device.apply_snapshot(
+            &[StateAttribute::StatusStateAttribute {
+                value: StatusValue::Cleaning,
+                flag: StatusFlag::Segment,
+                error: None,
+            }],
+            &(),
+            0x54,
+            0x55,
+            0x61,
+        );
+        assert!(
+            device
+                .cycle_timing
+                .borrow_mut()
+                .finish(std::time::Instant::now())
+                .is_some()
+        );
+        device.begin_timing(CycleMode::Cleaning, std::time::Instant::now());
+        device.acknowledge_timing();
+        status(&device, StatusValue::Cleaning, StatusFlag::Segment);
+        device.apply_snapshot(
+            &[StateAttribute::StatusStateAttribute {
+                value: StatusValue::Paused,
+                flag: StatusFlag::Resumable,
+                error: None,
+            }],
+            &(),
+            0x54,
+            0x55,
+            0x61,
+        );
+        device.queue_completion(0);
+        assert_eq!(
+            *device.pending_events.borrow(),
+            [OperationalEvent::Completed(0)]
+        );
+    }
+
+    #[test]
+    fn computed_completion_timing_is_frozen_before_queue_delivery() {
+        let device = device();
+        let now = std::time::Instant::now();
+        let start = now - time::Duration::from_secs(45);
+        let mut clock = CycleTiming::default();
+        clock.begin(CycleMode::Cleaning, start);
+        clock.acknowledge();
+        clock.observe(
+            DeviceState {
+                value: StatusValue::Cleaning,
+                flag: StatusFlag::Segment,
+            },
+            start,
+        );
+        clock.observe(
+            DeviceState {
+                value: StatusValue::Paused,
+                flag: StatusFlag::Resumable,
+            },
+            start + time::Duration::from_secs(10),
+        );
+        clock.observe(
+            DeviceState {
+                value: StatusValue::Cleaning,
+                flag: StatusFlag::Segment,
+            },
+            start + time::Duration::from_secs(30),
+        );
+        let timing = clock.finish(now).unwrap();
+        device.queue_event(OperationalEvent::CompletedWithTiming(0, timing));
+        device.invalidate_timing();
+        let event = device.pending_events.borrow().front().cloned().unwrap();
+        assert_eq!(
+            event,
+            OperationalEvent::CompletedWithTiming(
+                0,
+                CompletionTiming {
+                    total_seconds: Some(45),
+                    paused_seconds: Some(20)
+                }
+            )
+        );
+        use rs_matter::{tlv::TLVElement, utils::storage::WriteBuf};
+        let mut buffer = [0; 128];
+        let mut writer = WriteBuf::new(&mut buffer);
+        event.write(&mut writer).unwrap();
+        let fields = TLVElement::new(writer.as_slice()).structure().unwrap();
+        assert_eq!(fields.find_ctx(1).unwrap().u32().unwrap(), 45);
+        assert_eq!(fields.find_ctx(2).unwrap().u32().unwrap(), 20);
     }
 }
 

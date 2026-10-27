@@ -1575,10 +1575,12 @@ fn mapping_capability_advertises_mode_and_uses_mapping_api_without_unsafe_resume
             0
         );
         assert_eq!(device.cycle_mode.get(), CycleMode::Idle);
-        assert_eq!(
-            *device.pending_events.borrow(),
-            [OperationalEvent::Completed(0)]
-        );
+        // Timing is now present for this acknowledged, continuously observed mapping.
+        let events = device.pending_events.borrow();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events.front().unwrap(), OperationalEvent::CompletedWithTiming(0,
+            CompletionTiming { total_seconds: Some(_), paused_seconds: Some(0) })));
+        drop(events);
     }));
     server.join().unwrap();
 }
@@ -1654,4 +1656,84 @@ fn mapping_state_without_mapping_capability_is_not_published_as_a_selectable_mod
         ))
         .is_err()
     );
+}
+
+#[test]
+fn actual_start_ack_and_continuous_observation_control_encoded_timing_presence() {
+    for gap in [false, true] {
+        let (url, server) = serve(vec![Reply {
+            method: "PUT",
+            path: "/api/v2/robot/capabilities/BasicControlCapability",
+            status: 200,
+            body: "{}",
+            expected: Some(serde_json::json!({"action":"start"})),
+        }]);
+        let executor = Box::leak(Box::new(smol::LocalExecutor::new()));
+        let mut device = super::cycle_tests::device();
+        device.client = ValetudoClient::new(executor, url.parse().unwrap());
+        smol::block_on(executor.run(async {
+            let mut input = [0; 32];
+            let len = mode_request(&mut input, 1);
+            let request = TLVElement::new(&input[..len]);
+            let mut output = [0; 128];
+            let mut writer = WriteBuf::new(&mut output);
+            let response = rvc_run_mode::ChangeToModeResponseBuilder::new(
+                TLVWriteParent::new((), &mut writer),
+                &TLVTag::Anonymous,
+            )
+            .unwrap();
+            rvc_run_mode::ClusterAsyncHandler::handle_change_to_mode(
+                &device,
+                Context::default(),
+                rvc_run_mode::ChangeToModeRequest::from_tlv(&request).unwrap(),
+                response,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                TLVElement::new(writer.as_slice())
+                    .structure()
+                    .unwrap()
+                    .find_ctx(0)
+                    .unwrap()
+                    .u8()
+                    .unwrap(),
+                0
+            );
+        }));
+        let observe = |value| {
+            device.apply_attributes(
+                &[StateAttribute::StatusStateAttribute {
+                    value,
+                    flag: StatusFlag::None,
+                    error: None,
+                }],
+                &(),
+                0x54,
+                0x55,
+                0x61,
+            )
+        };
+        observe(StatusValue::Cleaning);
+        if gap {
+            device.apply_snapshot(&[], &(), 0x54, 0x55, 0x61);
+            observe(StatusValue::Cleaning);
+        }
+        observe(StatusValue::Idle);
+        assert_eq!(device.pending_events.borrow().len(), 1);
+        let event = device.pending_events.borrow().front().cloned().unwrap();
+        let mut bytes = [0; 128];
+        let mut writer = WriteBuf::new(&mut bytes);
+        event.write(&mut writer).unwrap();
+        let fields = TLVElement::new(writer.as_slice()).structure().unwrap();
+        assert_eq!(fields.find_ctx(0).unwrap().u8().unwrap(), 0);
+        if gap {
+            assert!(fields.find_ctx(1).unwrap().is_empty());
+            assert!(fields.find_ctx(2).unwrap().is_empty());
+        } else {
+            assert!(fields.find_ctx(1).unwrap().u32().is_ok());
+            assert_eq!(fields.find_ctx(2).unwrap().u32().unwrap(), 0);
+        }
+        server.join().unwrap();
+    }
 }
