@@ -983,14 +983,14 @@ fn real_operation_mode_change_notifies_and_selected_room_resume_uses_basic_contr
             method: "GET",
             path: "/api/v2/robot/capabilities",
             status: 200,
-            body: r#"["BasicControlCapability","OperationModeControlCapability","MapSegmentationCapability"]"#,
+            body: r#"["BasicControlCapability","OperationModeControlCapability","FanSpeedControlCapability","MapSegmentationCapability"]"#,
             expected: None,
         },
         Reply {
             method: "GET",
             path: "/api/v2/robot/capabilities/OperationModeControlCapability/presets",
             status: 200,
-            body: r#"["vacuum","mop","future_mode"]"#,
+            body: r#"["vacuum","mop","low","future_mode"]"#,
             expected: None,
         },
         Reply {
@@ -1110,4 +1110,228 @@ fn real_operation_mode_change_notifies_and_selected_room_resume_uses_basic_contr
         assert_eq!(*device.selected_areas.borrow(), [16]);
     }));
     server.join().unwrap();
+}
+
+async fn change_clean_mode(device: &Device, mode: u8, ctx: &Context) -> u8 {
+    let mut input = [0; 32];
+    let length = mode_request(&mut input, mode);
+    let request = TLVElement::new(&input[..length]);
+    let mut output = [0; 128];
+    let mut writer = WriteBuf::new(&mut output);
+    let response = rvc_clean_mode::ChangeToModeResponseBuilder::new(
+        TLVWriteParent::new((), &mut writer),
+        &TLVTag::Anonymous,
+    )
+    .unwrap();
+    rvc_clean_mode::ClusterAsyncHandler::handle_change_to_mode(
+        device,
+        ctx,
+        rvc_clean_mode::ChangeToModeRequest::from_tlv(&request).unwrap(),
+        response,
+    )
+    .await
+    .unwrap();
+    TLVElement::new(writer.as_slice())
+        .structure()
+        .unwrap()
+        .find_ctx(0)
+        .unwrap()
+        .u8()
+        .unwrap()
+}
+
+#[test]
+fn fan_modes_initialize_dispatch_and_handle_unknown_state() {
+    let (url, server) = serve(vec![
+        Reply {
+            method: "GET",
+            path: "/api/v2/robot/capabilities",
+            status: 200,
+            body: r#"["BasicControlCapability","FanSpeedControlCapability"]"#,
+            expected: None,
+        },
+        Reply {
+            method: "GET",
+            path: "/api/v2/robot/capabilities/FanSpeedControlCapability/presets",
+            status: 200,
+            body: r#"["low","medium","high","max","off","vacuum","future","low"]"#,
+            expected: None,
+        },
+        Reply {
+            method: "GET",
+            path: "/api/v2/robot/state/attributes",
+            status: 200,
+            body: r#"[{"__class":"StatusStateAttribute","value":"idle","flag":"none"},{"__class":"PresetSelectionStateAttribute","type":"fan_speed","value":"medium"}]"#,
+            expected: None,
+        },
+        Reply {
+            method: "PUT",
+            path: "/api/v2/robot/capabilities/FanSpeedControlCapability/preset",
+            status: 200,
+            body: "{}",
+            expected: Some(serde_json::json!({"name":"high"})),
+        },
+        Reply {
+            method: "PUT",
+            path: "/api/v2/robot/capabilities/FanSpeedControlCapability/preset",
+            status: 503,
+            body: "{}",
+            expected: Some(serde_json::json!({"name":"max"})),
+        },
+    ]);
+    let executor = Box::leak(Box::new(smol::LocalExecutor::new()));
+    smol::block_on(executor.run(async {
+        let device = Device::init(ValetudoClient::new(executor, url.parse().unwrap()))
+            .await
+            .unwrap();
+        assert!(device.fan_speed_modes);
+        assert!(device.supports_clean_modes());
+        assert_eq!(device.cleaning_presets.len(), 5);
+        assert_eq!(device.current_preset.get(), Some(Preset::Medium));
+        assert_eq!(
+            rvc_clean_mode::ClusterAsyncHandler::current_mode(&device, Context::default())
+                .await
+                .unwrap(),
+            5
+        );
+        let mut buffer = [0; 1024];
+        let mut writer = WriteBuf::new(&mut buffer);
+        let array = dm::clusters::decl::globals::ModeOptionStructArrayBuilder::new(
+            TLVWriteParent::new((), &mut writer),
+            &TLVTag::Anonymous,
+        )
+        .unwrap();
+        rvc_clean_mode::ClusterAsyncHandler::supported_modes(
+            &device,
+            Context::default(),
+            dm::ArrayAttributeRead::ReadAll(array),
+        )
+        .await
+        .unwrap();
+        let entries = TLVElement::new(writer.as_slice())
+            .array()
+            .unwrap()
+            .iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 5);
+        for (entry, id) in entries.iter().zip(4..=8) {
+            assert_eq!(
+                entry
+                    .structure()
+                    .unwrap()
+                    .find_ctx(1)
+                    .unwrap()
+                    .u8()
+                    .unwrap(),
+                id
+            );
+        }
+        let ctx = Context::default();
+        assert_eq!(change_clean_mode(&device, 0, &ctx).await, 1); // recognized but unavailable
+        assert_eq!(change_clean_mode(&device, 255, &ctx).await, 1);
+        assert_eq!(ctx.notifications.get(), 0);
+        assert_eq!(change_clean_mode(&device, 6, &ctx).await, 0);
+        assert_eq!(device.current_preset.get(), Some(Preset::High));
+        assert_eq!(ctx.notifications.get(), 1);
+        assert_eq!(change_clean_mode(&device, 7, &ctx).await, 2);
+        assert_eq!(device.current_preset.get(), Some(Preset::High));
+        device.apply_attributes(
+            &[StateAttribute::PresetSelectionStateAttribute {
+                r#type: "operation_mode".into(),
+                value: "vacuum".into(),
+            }],
+            &ctx,
+            0x54,
+            0x55,
+            0x61,
+        );
+        assert_eq!(device.current_preset.get(), Some(Preset::High));
+        device.apply_attributes(
+            &[StateAttribute::PresetSelectionStateAttribute {
+                r#type: "fan_speed".into(),
+                value: "future".into(),
+            }],
+            &ctx,
+            0x54,
+            0x55,
+            0x61,
+        );
+        assert_eq!(device.current_preset.get(), None);
+        assert!(
+            rvc_clean_mode::ClusterAsyncHandler::current_mode(&device, Context::default())
+                .await
+                .is_err()
+        );
+        device.apply_attributes(
+            &[StateAttribute::PresetSelectionStateAttribute {
+                r#type: "fan_speed".into(),
+                value: "low".into(),
+            }],
+            &ctx,
+            0x54,
+            0x55,
+            0x61,
+        );
+        assert_eq!(device.current_preset.get(), Some(Preset::Low));
+        device.apply_snapshot(
+            &[StateAttribute::StatusStateAttribute {
+                value: StatusValue::Idle,
+                flag: StatusFlag::None,
+                error: None,
+            }],
+            &ctx,
+            0x54,
+            0x55,
+            0x61,
+        );
+        assert_eq!(device.current_preset.get(), None);
+    }));
+    server.join().unwrap();
+}
+
+#[test]
+fn fan_modes_require_two_recognized_options_and_optional_api_failures_are_safe() {
+    for (status, presets, expected_len, enabled) in [
+        (200, r#"["low","future"]"#, 1, false),
+        (200, r#"["off","future","off"]"#, 1, false),
+        (200, r#"["low","off"]"#, 2, true),
+        (200, r#"["vacuum","mop","future"]"#, 0, false),
+        (200, r#"{"wrong":"shape"}"#, 0, false),
+        (503, "{}", 0, false),
+    ] {
+        let (url, server) = serve(vec![
+            Reply {
+                method: "GET",
+                path: "/api/v2/robot/capabilities",
+                status: 200,
+                body: r#"["BasicControlCapability","FanSpeedControlCapability"]"#,
+                expected: None,
+            },
+            Reply {
+                method: "GET",
+                path: "/api/v2/robot/capabilities/FanSpeedControlCapability/presets",
+                status,
+                body: presets,
+                expected: None,
+            },
+            Reply {
+                method: "GET",
+                path: "/api/v2/robot/state/attributes",
+                status: 200,
+                body: r#"[{"__class":"StatusStateAttribute","value":"idle","flag":"none"},{"__class":"PresetSelectionStateAttribute","type":"fan_speed","value":"future"}]"#,
+                expected: None,
+            },
+        ]);
+        let executor = Box::leak(Box::new(smol::LocalExecutor::new()));
+        let device = smol::block_on(executor.run(Device::init(ValetudoClient::new(
+            executor,
+            url.parse().unwrap(),
+        ))))
+        .unwrap();
+        assert_eq!(device.cleaning_presets.len(), expected_len);
+        assert_eq!(device.supports_clean_modes(), enabled);
+        assert_eq!(device.current_preset.get(), None);
+        server.join().unwrap();
+    }
 }

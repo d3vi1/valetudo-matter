@@ -44,6 +44,7 @@ pub(crate) struct Device {
     pub(crate) client: ValetudoClient,
     pub(crate) capabilities: EnumSet<Capability>,
     pub(crate) cleaning_presets: EnumSet<Preset>,
+    pub(crate) fan_speed_modes: bool,
     pub(crate) current_preset: VersionedCell<Option<Preset>>,
     pub(crate) current_state: VersionedCell<DeviceState>,
     pub(crate) identify_time: VersionedCell<u16>,
@@ -81,22 +82,32 @@ impl Device {
             bail!("Device requires at least BasicControlCapability");
         }
 
-        let cleaning_presets = if capabilities.contains(Capability::OperationModeControlCapability)
-        {
-            match client
-                .get::<Vec<String>>(
-                    "/api/v2/robot/capabilities/OperationModeControlCapability/presets",
-                )
-                .await
-            {
-                Ok(presets) => known_presets(presets),
+        let fan_speed_modes = !capabilities.contains(Capability::OperationModeControlCapability)
+            && capabilities.contains(Capability::FanSpeedControlCapability);
+        let preset_path = if capabilities.contains(Capability::OperationModeControlCapability) {
+            Some("/api/v2/robot/capabilities/OperationModeControlCapability/presets")
+        } else if fan_speed_modes {
+            Some("/api/v2/robot/capabilities/FanSpeedControlCapability/presets")
+        } else {
+            None
+        };
+        let cleaning_presets = match preset_path {
+            Some(path) => match client.get::<Vec<String>>(path).await {
+                Ok(presets) => known_presets(presets)
+                    .iter()
+                    .filter(|preset| {
+                        matches!(
+                            preset,
+                            Preset::Low | Preset::Medium | Preset::High | Preset::Max | Preset::Off
+                        ) == fan_speed_modes
+                    })
+                    .collect(),
                 Err(error) => {
                     warn!("Optional cleaning presets unavailable: {error:#}");
                     EnumSet::new()
                 }
-            }
-        } else {
-            EnumSet::new()
+            },
+            None => EnumSet::new(),
         };
 
         if cleaning_presets.is_empty() {
@@ -125,7 +136,12 @@ impl Device {
 
         let current_preset_value = attributes.iter().find_map(|attr| match attr {
             state::StateAttribute::PresetSelectionStateAttribute { r#type, value }
-                if r#type == "operation_mode" =>
+                if r#type
+                    == if fan_speed_modes {
+                        "fan_speed"
+                    } else {
+                        "operation_mode"
+                    } =>
             {
                 Some(value.as_str())
             }
@@ -154,6 +170,7 @@ impl Device {
             client: client.clone(),
             capabilities,
             cleaning_presets,
+            fan_speed_modes,
             current_preset: VersionedCell::new(default_preset, &mut thread_rng()),
             current_state,
             identify_time: VersionedCell::new(0, &mut thread_rng()),
@@ -333,7 +350,11 @@ impl Device {
                 flag: BatteryFlag::Unknown,
             });
         }
-        let preset_type = "operation_mode";
+        let preset_type = if self.fan_speed_modes {
+            "fan_speed"
+        } else {
+            "operation_mode"
+        };
         if !attrs.iter().any(|attr| matches!(attr, StateAttribute::PresetSelectionStateAttribute { r#type, .. } if r#type == preset_type)) {
             if self.current_preset.replace(None).is_some() { notify.notify_cluster_changed(1, clean_mode_cluster); }
         }
@@ -470,7 +491,12 @@ impl Device {
                     }
                 }
                 state::StateAttribute::PresetSelectionStateAttribute { r#type, value }
-                    if r#type == "operation_mode" =>
+                    if r#type
+                        == if self.fan_speed_modes {
+                            "fan_speed"
+                        } else {
+                            "operation_mode"
+                        } =>
                 {
                     let preset =
                         preset_from_str(value).filter(|p| self.cleaning_presets.contains(*p));
@@ -557,10 +583,18 @@ impl Device {
 
     pub(crate) fn supports_clean_modes(&self) -> bool {
         self.cleaning_presets.len() >= 2
-            && self
-                .cleaning_presets
-                .iter()
-                .any(|preset| matches!(preset, Preset::Vacuum | Preset::Mop | Preset::VacuumAndMop))
+            && self.cleaning_presets.iter().any(|preset| {
+                matches!(
+                    preset,
+                    Preset::Vacuum
+                        | Preset::Mop
+                        | Preset::VacuumAndMop
+                        | Preset::Low
+                        | Preset::Medium
+                        | Preset::High
+                        | Preset::Max
+                )
+            })
     }
 
     pub(crate) fn cycle_active(&self) -> bool {
@@ -648,12 +682,21 @@ impl Device {
             Preset::Mop => "mop",
             Preset::VacuumAndMop => "vacuum_and_mop",
             Preset::VacuumThenMop => "vacuum_then_mop",
+            Preset::Low => "low",
+            Preset::Medium => "medium",
+            Preset::High => "high",
+            Preset::Max => "max",
+            Preset::Off => "off",
         };
 
         debug!("setting operation mode preset to {name}");
         self.client
             .put(
-                "/api/v2/robot/capabilities/OperationModeControlCapability/preset",
+                if self.fan_speed_modes {
+                    "/api/v2/robot/capabilities/FanSpeedControlCapability/preset"
+                } else {
+                    "/api/v2/robot/capabilities/OperationModeControlCapability/preset"
+                },
                 format!(r#"{{"name": "{name}"}}"#),
             )
             .await
@@ -682,6 +725,11 @@ fn preset_from_str(s: &str) -> Option<Preset> {
         "mop" => Some(Preset::Mop),
         "vacuum_and_mop" => Some(Preset::VacuumAndMop),
         "vacuum_then_mop" => Some(Preset::VacuumThenMop),
+        "low" => Some(Preset::Low),
+        "medium" => Some(Preset::Medium),
+        "high" => Some(Preset::High),
+        "max" => Some(Preset::Max),
+        "off" => Some(Preset::Off),
         _ => None,
     }
 }
@@ -805,6 +853,7 @@ mod cycle_tests {
             client: ValetudoClient::new(executor, "http://127.0.0.1:1".parse().unwrap()),
             capabilities: EnumSet::new(),
             cleaning_presets: EnumSet::new(),
+            fan_speed_modes: false,
             current_preset: VersionedCell::new(None, &mut thread_rng()),
             current_state: VersionedCell::new(DeviceState::default(), &mut thread_rng()),
             identify_time: VersionedCell::new(0, &mut thread_rng()),

@@ -81,6 +81,16 @@ pub(crate) enum Preset {
     VacuumAndMop,
     #[serde(rename = "vacuum_then_mop")]
     VacuumThenMop,
+    #[serde(rename = "low")]
+    Low,
+    #[serde(rename = "medium")]
+    Medium,
+    #[serde(rename = "high")]
+    High,
+    #[serde(rename = "max")]
+    Max,
+    #[serde(rename = "off")]
+    Off,
 }
 
 /// Preserve vendor details without guessing Matter error codes from translated text.
