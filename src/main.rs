@@ -1,4 +1,4 @@
-use std::{path::PathBuf, str::FromStr};
+use std::str::FromStr;
 
 use anyhow::{Context, bail};
 use log::info;
@@ -12,6 +12,7 @@ mod handlers;
 mod http;
 mod net;
 mod node;
+mod persistence_path;
 
 const DEFAULT_VALETUDO_URI: &str = "http://localhost:80";
 
@@ -33,11 +34,8 @@ async fn run(ex: &'static LocalExecutor<'static>) -> anyhow::Result<()> {
         bail!("Invalid VALETUDO_MATTER_BASE_URI: {valetudo_uri}");
     }
 
-    let persistence_dir = if let Ok(v) = std::env::var("VALETUDO_MATTER_PERSISTENCE") {
-        PathBuf::from(v)
-    } else {
-        std::env::temp_dir().join("valetudo-matter")
-    };
+    let persistence_dir = persistence_path::resolve()?;
+    info!("Matter state directory: {}", persistence_dir.display());
 
     if let Some(parent) = persistence_dir.parent() {
         std::fs::create_dir_all(parent)?;
