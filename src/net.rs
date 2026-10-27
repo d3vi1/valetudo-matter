@@ -87,7 +87,7 @@ impl Netif {
         )?;
 
         socket.set_reuse_address(true)?;
-        socket.set_reuse_port(true)?;
+        allow_unsupported_reuse_port(socket.set_reuse_port(true))?;
         socket.set_only_v6(false)?;
         socket.bind(&MDNS_SOCKET_DEFAULT_BIND_ADDR.into())?;
 
@@ -115,4 +115,45 @@ fn interface_suitable(interface: &Interface) -> bool {
 
     interface.flags.contains(InterfaceFlags::UP)
         && interface.flags.contains(InterfaceFlags::BROADCAST)
+}
+
+// SO_REUSEPORT is unavailable on older Linux kernels. SO_REUSEADDR is
+// already enabled by the caller; only an unsupported option is recoverable.
+fn allow_unsupported_reuse_port(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        #[cfg(target_os = "linux")]
+        Err(error) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => {
+            debug!("SO_REUSEPORT unavailable; using SO_REUSEADDR for mDNS");
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_reuse_port_is_recoverable_only_on_linux() {
+        let result =
+            allow_unsupported_reuse_port(Err(io::Error::from_raw_os_error(libc::ENOPROTOOPT)));
+        if cfg!(target_os = "linux") {
+            assert!(result.is_ok());
+        } else {
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOPROTOOPT));
+        }
+    }
+
+    #[test]
+    fn reuse_port_preserves_other_errors_and_success() {
+        assert!(allow_unsupported_reuse_port(Ok(())).is_ok());
+        for errno in [libc::EACCES, libc::EINVAL, libc::EBADF] {
+            let error =
+                allow_unsupported_reuse_port(Err(io::Error::from_raw_os_error(errno))).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(errno));
+        }
+        let error = allow_unsupported_reuse_port(Err(io::Error::other("synthetic"))).unwrap_err();
+        assert_eq!(error.to_string(), "synthetic");
+    }
 }
