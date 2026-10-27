@@ -16,7 +16,7 @@ paths. Native device binding needs Linux and permission for SO_BINDTODEVICE.
 `deploy/run.sh` supervises `/mnt/data/valetudo-matter/valetudo-matter`, stores node
 state under `/mnt/data/valetudo-matter/persistence`, and keeps two logs in RAM.
 `deploy/S12valetudo-matter` is an example for `/etc/init`; inspect your boot scheme
-before enabling it. Start after Valetudo and the Wi-Fi connection are available.
+before enabling it. Install both scripts with executable permissions (0755). Start after Valetudo and the Wi-Fi connection are available.
 The loop retries startup after 30 seconds if the API/interface is unavailable.
 
 For an upgrade, stop this service, verify that the child exited, back up the
